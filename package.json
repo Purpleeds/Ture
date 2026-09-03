@@ -1,0 +1,19 @@
+{
+  "name": "socket-chat-render",
+  "version": "2.0.0",
+  "description": "Express and Socket.IO chat app for Render deployment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0 <22.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.9.1",
+    "express": "^4.18.3",
+    "socket.io": "^4.7.5"
+  }
+}
