@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -14,13 +14,21 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
+// Large file uploads (the 10GB file-share feature) still live on local disk,
+// not in the database - Postgres is the wrong place for gigabyte blobs, and
+// this feature already auto-deletes after a few hours anyway (see
+// FILE_EXPIRY_HOURS below). On Render's free tier this folder does NOT
+// survive a restart/sleep cycle, same as before - only messages, accounts,
+// servers, avatars and server icons are now safe from that, because those
+// live in Postgres instead.
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const DB_PATH = path.join(DATA_DIR, 'chat.db');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-const AVATAR_DIR = path.join(DATA_DIR, 'avatars');
 const MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024; // 10GB
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB for avatars / server icons
+// Avatars/server icons are stored as data: URIs directly in Postgres, so
+// they must stay small - 1.5MB of raw image data (before it grows ~33%
+// larger as base64 text) keeps each row a sane size.
+const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
 const FILE_EXPIRY_HOURS = 6;
 const DEFAULT_CHANNELS = ['general', 'gaming', 'coding'];
 const DEFAULT_SERVER_NAME = 'general';
@@ -49,7 +57,7 @@ const DEFAULT_SERVER_NAME = 'general';
 // Example:
 //   { username: 'Moderator1', password: 'another-password', isAdmin: true },
 const SEED_ACCOUNTS = [
-  // { username: 'Purple', password: 'WillZhao12', isAdmin: true },
+  // { username: 'Moderator1', password: 'another-password', isAdmin: true },
 ];
 
 // If true, logging in with a username that doesn't exist yet will create
@@ -66,10 +74,29 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif',
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+if (!process.env.DATABASE_URL) {
+  console.error('DATABASE_URL is not set. This app needs a Postgres database - see the deployment notes.');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Render's managed Postgres requires SSL; local/self-hosted Postgres
+  // usually doesn't offer it. This accepts either without extra config.
+  ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false }
+});
+
+// Small helper so call sites read like the old synchronous style
+// ("await q(...)") instead of repeating pool.query(...).rows everywhere.
+async function q(text, params) {
+  const result = await pool.query(text, params);
+  return result.rows;
+}
+async function one(text, params) {
+  const rows = await q(text, params);
+  return rows[0] || null;
+}
 
 app.use(express.json({ limit: '256kb' }));
 app.use(express.static(PUBLIC_DIR));
@@ -78,215 +105,212 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
   fallthrough: false,
   maxAge: `${FILE_EXPIRY_HOURS}h`
 }));
-// Avatars and server icons are permanent, so they get their own folder that
-// the 6 hour file cleaner never touches.
-app.use('/avatars', express.static(AVATAR_DIR, {
-  index: false,
-  fallthrough: false,
-  maxAge: '7d'
-}));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-function safeAlter(sql) {
-  try { db.exec(sql); } catch (_) {}
+// ---------------- DB SCHEMA ----------------
+async function setupSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      display_name TEXT,
+      avatar_url TEXT,
+      banned INTEGER DEFAULT 0,
+      is_admin INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS channels (
+      name TEXT PRIMARY KEY,
+      created_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS servers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      icon_url TEXT,
+      invite_code TEXT UNIQUE,
+      is_default INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS server_members (
+      server_id INTEGER NOT NULL,
+      username TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(server_id, username)
+    );
+
+    CREATE TABLE IF NOT EXISTS server_channels (
+      id SERIAL PRIMARY KEY,
+      server_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      room TEXT UNIQUE NOT NULL,
+      topic TEXT,
+      position INTEGER DEFAULT 0,
+      created_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(server_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      room TEXT NOT NULL,
+      "user" TEXT NOT NULL,
+      text TEXT NOT NULL,
+      to_user TEXT,
+      is_group INTEGER DEFAULT 0,
+      reply_to INTEGER,
+      edited_at TIMESTAMPTZ,
+      deleted_at TIMESTAMPTZ,
+      deleted_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS files (
+      id SERIAL PRIMARY KEY,
+      room TEXT NOT NULL,
+      "user" TEXT NOT NULL,
+      to_user TEXT,
+      is_group INTEGER DEFAULT 0,
+      file_name TEXT NOT NULL,
+      file_type TEXT,
+      file_url TEXT NOT NULL,
+      file_size BIGINT,
+      caption TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_groups (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      icon_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_id INTEGER NOT NULL,
+      username TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(group_id, username)
+    );
+
+    CREATE TABLE IF NOT EXISTS friendships (
+      requester TEXT NOT NULL,
+      addressee TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(requester, addressee)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_reactions (
+      message_id INTEGER NOT NULL,
+      username TEXT NOT NULL,
+      emoji TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(message_id, username, emoji)
+    );
+
+    CREATE TABLE IF NOT EXISTS read_receipts (
+      room TEXT NOT NULL,
+      username TEXT NOT NULL,
+      last_message_id INTEGER DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(room, username)
+    );
+
+    CREATE TABLE IF NOT EXISTS mutes (
+      username TEXT PRIMARY KEY,
+      muted_until TIMESTAMPTZ NOT NULL,
+      muted_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
 }
-
-// ---------------- DB ----------------
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  display_name TEXT,
-  avatar_url TEXT,
-  banned INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS channels (
-  name TEXT PRIMARY KEY,
-  created_by TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS servers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  owner TEXT NOT NULL,
-  icon_url TEXT,
-  invite_code TEXT UNIQUE,
-  is_default INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS server_members (
-  server_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  role TEXT DEFAULT 'member',
-  joined_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(server_id, username)
-);
-
-CREATE TABLE IF NOT EXISTS server_channels (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  server_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  room TEXT UNIQUE NOT NULL,
-  topic TEXT,
-  position INTEGER DEFAULT 0,
-  created_by TEXT,
-  created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(server_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  room TEXT NOT NULL,
-  user TEXT NOT NULL,
-  text TEXT NOT NULL,
-  to_user TEXT,
-  is_group INTEGER DEFAULT 0,
-  reply_to INTEGER,
-  edited_at TEXT,
-  deleted_at TEXT,
-  deleted_by TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS files (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  room TEXT NOT NULL,
-  user TEXT NOT NULL,
-  to_user TEXT,
-  is_group INTEGER DEFAULT 0,
-  file_name TEXT NOT NULL,
-  file_type TEXT,
-  file_url TEXT NOT NULL,
-  file_size INTEGER,
-  caption TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS chat_groups (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  owner TEXT NOT NULL,
-  icon_url TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS group_members (
-  group_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  role TEXT DEFAULT 'member',
-  joined_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(group_id, username)
-);
-
-CREATE TABLE IF NOT EXISTS friendships (
-  requester TEXT NOT NULL,
-  addressee TEXT NOT NULL,
-  status TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(requester, addressee)
-);
-
-CREATE TABLE IF NOT EXISTS message_reactions (
-  message_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  emoji TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(message_id, username, emoji)
-);
-
-CREATE TABLE IF NOT EXISTS read_receipts (
-  room TEXT NOT NULL,
-  username TEXT NOT NULL,
-  last_message_id INTEGER DEFAULT 0,
-  updated_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(room, username)
-);
-
-CREATE TABLE IF NOT EXISTS mutes (
-  username TEXT PRIMARY KEY,
-  muted_until TEXT NOT NULL,
-  muted_by TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-`);
-
-safeAlter(`ALTER TABLE users ADD COLUMN display_name TEXT;`);
-safeAlter(`ALTER TABLE users ADD COLUMN avatar_url TEXT;`);
-safeAlter(`ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0;`);
-safeAlter(`ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN to_user TEXT;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN is_group INTEGER DEFAULT 0;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN reply_to INTEGER;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN edited_at TEXT;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN deleted_at TEXT;`);
-safeAlter(`ALTER TABLE messages ADD COLUMN deleted_by TEXT;`);
-safeAlter(`ALTER TABLE files ADD COLUMN to_user TEXT;`);
-safeAlter(`ALTER TABLE files ADD COLUMN is_group INTEGER DEFAULT 0;`);
-safeAlter(`ALTER TABLE files ADD COLUMN file_url TEXT;`);
-safeAlter(`ALTER TABLE files ADD COLUMN file_size INTEGER;`);
-safeAlter(`ALTER TABLE files ADD COLUMN caption TEXT;`);
-safeAlter(`ALTER TABLE server_channels ADD COLUMN topic TEXT;`);
 
 // ---------------- SERVERS (guilds) ----------------
 function makeInviteCode() {
   return crypto.randomBytes(4).toString('hex');
 }
 
-const getServerStmt = db.prepare(`SELECT * FROM servers WHERE id = ?`);
-const getServerByCode = db.prepare(`SELECT * FROM servers WHERE invite_code = ?`);
-const getChannelByRoomStmt = db.prepare(`SELECT * FROM server_channels WHERE room = ?`);
-const getChannelByIdStmt = db.prepare(`SELECT * FROM server_channels WHERE id = ?`);
-const getChannelsForServer = db.prepare(`SELECT * FROM server_channels WHERE server_id = ? ORDER BY position ASC, id ASC`);
-const insertServerChannel = db.prepare(`INSERT INTO server_channels (server_id, name, room, position, created_by) VALUES (?, ?, ?, ?, ?)`);
+async function getServerById(id) {
+  return one(`SELECT * FROM servers WHERE id = $1`, [id]);
+}
+async function getServerByCode(code) {
+  return one(`SELECT * FROM servers WHERE invite_code = $1`, [code]);
+}
+async function getChannelByRoom(room) {
+  return one(`SELECT * FROM server_channels WHERE room = $1`, [room]);
+}
+async function getChannelById(id) {
+  return one(`SELECT * FROM server_channels WHERE id = $1`, [id]);
+}
+async function getChannelsForServer(serverId) {
+  return q(`SELECT * FROM server_channels WHERE server_id = $1 ORDER BY position ASC, id ASC`, [serverId]);
+}
+async function insertServerChannel(serverId, name, room, position, createdBy) {
+  return one(
+    `INSERT INTO server_channels (server_id, name, room, position, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [serverId, name, room, position, createdBy]
+  );
+}
 
-function ensureDefaultServer() {
-  let row = db.prepare(`SELECT * FROM servers WHERE is_default = 1`).get();
+async function ensureDefaultServer() {
+  let row = await one(`SELECT * FROM servers WHERE is_default = 1`);
   if (!row) {
-    const result = db.prepare(`
-      INSERT INTO servers (name, owner, invite_code, is_default)
-      VALUES (?, 'system', ?, 1)
-    `).run(DEFAULT_SERVER_NAME, makeInviteCode());
-    row = getServerStmt.get(result.lastInsertRowid);
+    row = await one(
+      `INSERT INTO servers (name, owner, invite_code, is_default) VALUES ($1, 'system', $2, 1) RETURNING *`,
+      [DEFAULT_SERVER_NAME, makeInviteCode()]
+    );
   }
 
   // Original channels keep their plain room names so old history survives.
-  DEFAULT_CHANNELS.forEach((name, index) => {
-    const existing = getChannelByRoomStmt.get(name);
-    if (!existing) insertServerChannel.run(row.id, name, name, index, 'system');
-  });
+  let index = 0;
+  for (const name of DEFAULT_CHANNELS) {
+    const existing = await getChannelByRoom(name);
+    if (!existing) await insertServerChannel(row.id, name, name, index, 'system');
+    index++;
+  }
 
   // Anything created through the old admin panel joins the default server too.
-  for (const legacy of db.prepare(`SELECT name, created_by FROM channels`).all()) {
-    if (!getChannelByRoomStmt.get(legacy.name)) {
-      try { insertServerChannel.run(row.id, legacy.name, legacy.name, 99, legacy.created_by || 'system'); } catch (_) {}
+  const legacyChannels = await q(`SELECT name, created_by FROM channels`);
+  for (const legacy of legacyChannels) {
+    const existing = await getChannelByRoom(legacy.name);
+    if (!existing) {
+      try { await insertServerChannel(row.id, legacy.name, legacy.name, 99, legacy.created_by || 'system'); } catch (_) {}
     }
   }
   return row;
 }
 
-let DEFAULT_SERVER = ensureDefaultServer();
+let DEFAULT_SERVER = null;
 
-for (const name of DEFAULT_CHANNELS) {
-  db.prepare(`INSERT OR IGNORE INTO channels (name, created_by) VALUES (?, 'system')`).run(name);
+async function getUser(username) {
+  return one(`SELECT * FROM users WHERE username = $1`, [username]);
 }
-
-const createUser = db.prepare(`INSERT INTO users (username, password_hash, display_name) VALUES (?, ?, ?)`);
-const getUser = db.prepare(`SELECT * FROM users WHERE username = ?`);
-const updateProfileStmt = db.prepare(`UPDATE users SET display_name = ?, avatar_url = ? WHERE username = ?`);
-const setAdminStmt = db.prepare(`UPDATE users SET is_admin = ? WHERE username = ?`);
+async function createUser(username, passwordHash, displayName) {
+  return one(
+    `INSERT INTO users (username, password_hash, display_name) VALUES ($1, $2, $3) RETURNING *`,
+    [username, passwordHash, displayName]
+  );
+}
+async function setAdminFlag(username, isAdminValue) {
+  await pool.query(`UPDATE users SET is_admin = $1 WHERE username = $2`, [isAdminValue ? 1 : 0, username]);
+}
 
 // Create any accounts listed in SEED_ACCOUNTS above that don't exist yet,
 // and sync isAdmin for any that do. Runs once, every time the server boots.
-function applySeedAccounts() {
+async function applySeedAccounts() {
   for (const entry of SEED_ACCOUNTS) {
     const seedUsername = String((entry && entry.username) || '').trim();
     const seedPassword = String((entry && entry.password) || '');
@@ -297,13 +321,13 @@ function applySeedAccounts() {
       continue;
     }
 
-    const existing = getUser.get(seedUsername);
+    const existing = await getUser(seedUsername);
     if (existing) {
       // Already exists - never touch their password, but keep isAdmin in
       // sync with what's written in SEED_ACCOUNTS so flipping true/false
       // here and restarting is enough to promote or demote them.
       if (!!existing.is_admin !== seedIsAdmin) {
-        setAdminStmt.run(seedIsAdmin ? 1 : 0, seedUsername);
+        await setAdminFlag(seedUsername, seedIsAdmin);
         console.log(`[seed-accounts] ${seedIsAdmin ? 'promoted' : 'demoted'} "${seedUsername}" (isAdmin: ${seedIsAdmin})`);
       }
       continue;
@@ -319,41 +343,54 @@ function applySeedAccounts() {
     }
     try {
       const hash = bcrypt.hashSync(seedPassword, 10);
-      createUser.run(seedUsername, hash, entry.displayName || seedUsername);
-      if (seedIsAdmin) setAdminStmt.run(1, seedUsername);
+      await createUser(seedUsername, hash, entry.displayName || seedUsername);
+      if (seedIsAdmin) await setAdminFlag(seedUsername, true);
       console.log(`[seed-accounts] created account "${seedUsername}"${seedIsAdmin ? ' (admin)' : ''}`);
     } catch (err) {
       console.warn(`[seed-accounts] could not create "${seedUsername}": ${err.message}`);
     }
   }
 }
-applySeedAccounts();
-const insertChannelStmt = db.prepare(`INSERT INTO channels (name, created_by) VALUES (?, ?)`);
-const deleteChannelStmt = db.prepare(`DELETE FROM channels WHERE name = ?`);
-const getMessageById = db.prepare(`SELECT * FROM messages WHERE id = ?`);
-const getMessages = db.prepare(`
-  SELECT id, room, user, text, to_user, is_group, reply_to, edited_at, deleted_at, deleted_by, created_at
-  FROM messages
-  WHERE room = ?
-  ORDER BY id ASC
-  LIMIT 300
-`);
-const insertMessage = db.prepare(`
-  INSERT INTO messages (room, user, text, to_user, is_group, reply_to)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-const insertFile = db.prepare(`
-  INSERT INTO files (room, user, to_user, is_group, file_name, file_type, file_url, file_size, caption)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-const getFileById = db.prepare(`SELECT * FROM files WHERE id = ?`);
-const getFiles = db.prepare(`
-  SELECT id, room, user, to_user, is_group, file_name, file_type, file_url, file_size, caption, created_at
-  FROM files
-  WHERE room = ?
-  ORDER BY id ASC
-  LIMIT 120
-`);
+
+async function insertChannel(name, createdBy) {
+  await pool.query(`INSERT INTO channels (name, created_by) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`, [name, createdBy]);
+}
+async function deleteChannelRow(name) {
+  await pool.query(`DELETE FROM channels WHERE name = $1`, [name]);
+}
+async function getMessageById(id) {
+  return one(`SELECT * FROM messages WHERE id = $1`, [id]);
+}
+async function getMessagesForRoom(room) {
+  return q(
+    `SELECT id, room, "user", text, to_user, is_group, reply_to, edited_at, deleted_at, deleted_by, created_at
+     FROM messages WHERE room = $1 ORDER BY id ASC LIMIT 300`,
+    [room]
+  );
+}
+async function insertMessage(room, user, text, toUser, isGroup, replyTo) {
+  return one(
+    `INSERT INTO messages (room, "user", text, to_user, is_group, reply_to) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [room, user, text, toUser, isGroup, replyTo]
+  );
+}
+async function insertFile(room, user, toUser, isGroup, fileName, fileType, fileUrl, fileSize, caption) {
+  return one(
+    `INSERT INTO files (room, "user", to_user, is_group, file_name, file_type, file_url, file_size, caption)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [room, user, toUser, isGroup, fileName, fileType, fileUrl, fileSize, caption]
+  );
+}
+async function getFileById(id) {
+  return one(`SELECT * FROM files WHERE id = $1`, [id]);
+}
+async function getFilesForRoom(room) {
+  return q(
+    `SELECT id, room, "user", to_user, is_group, file_name, file_type, file_url, file_size, caption, created_at
+     FROM files WHERE room = $1 ORDER BY id ASC LIMIT 120`,
+    [room]
+  );
+}
 
 // ---------------- AUTH / USERS ----------------
 const tokens = new Map(); // token -> username
@@ -382,9 +419,9 @@ function cleanText(value, max = 4000) {
 // made a global admin via the SEED_ACCOUNTS { isAdmin: true } property or
 // by an existing global admin right-clicking a user and choosing
 // "Make Admin" (users.is_admin in the database).
-function isAdmin(username) {
+async function isAdmin(username) {
   if (username === 'Purple') return true;
-  const user = getUser.get(username);
+  const user = await getUser(username);
   return !!(user && user.is_admin);
 }
 
@@ -394,18 +431,18 @@ function createToken(username) {
   return token;
 }
 
-function authFromRequest(req) {
+async function authFromRequest(req) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   const username = tokens.get(token) || null;
   if (!username) return null;
-  const user = getUser.get(username);
+  const user = await getUser(username);
   if (!user || user.banned) return null;
   return username;
 }
 
-function requireAuth(req, res, next) {
-  const username = authFromRequest(req);
+async function requireAuth(req, res, next) {
+  const username = await authFromRequest(req);
   if (!username) return res.status(401).json({ error: 'not authenticated' });
   req.username = username;
   next();
@@ -465,26 +502,26 @@ function groupIdFromRoom(room) {
   return match ? Number(match[1]) : null;
 }
 
-function getGroup(id) {
-  return db.prepare(`SELECT * FROM chat_groups WHERE id = ?`).get(id);
+async function getGroup(id) {
+  return one(`SELECT * FROM chat_groups WHERE id = $1`, [id]);
 }
 
-function isGroupMember(username, groupId) {
-  return !!db.prepare(`SELECT 1 FROM group_members WHERE group_id = ? AND username = ?`).get(groupId, username);
+async function isGroupMember(username, groupId) {
+  return !!(await one(`SELECT 1 FROM group_members WHERE group_id = $1 AND username = $2`, [groupId, username]));
 }
 
-function isServerMember(username, serverId) {
-  const srv = getServerStmt.get(serverId);
+async function isServerMember(username, serverId) {
+  const srv = await getServerById(serverId);
   if (!srv) return false;
   if (srv.is_default) return true; // everyone is in the default "general" server
-  return !!db.prepare(`SELECT 1 FROM server_members WHERE server_id = ? AND username = ?`).get(serverId, username);
+  return !!(await one(`SELECT 1 FROM server_members WHERE server_id = $1 AND username = $2`, [serverId, username]));
 }
 
-function serverMemberRole(username, serverId) {
-  const srv = getServerStmt.get(serverId);
+async function serverMemberRole(username, serverId) {
+  const srv = await getServerById(serverId);
   if (!srv) return null;
   if (srv.owner === username) return 'owner';
-  const row = db.prepare(`SELECT role FROM server_members WHERE server_id = ? AND username = ?`).get(serverId, username);
+  const row = await one(`SELECT role FROM server_members WHERE server_id = $1 AND username = $2`, [serverId, username]);
   return row ? row.role : null;
 }
 
@@ -492,100 +529,107 @@ function serverMemberRole(username, serverId) {
 // THIS server only. They can manage this server's channels and moderate
 // messages/members here, but can never delete the server or act on the
 // owner - that stays owner + global-admin only, via canManageServer below.
-function isServerAdmin(username, serverId) {
-  if (isAdmin(username)) return true; // global admin outranks everyone everywhere
-  return serverMemberRole(username, serverId) === 'admin' || serverMemberRole(username, serverId) === 'owner';
+async function isServerAdmin(username, serverId) {
+  if (await isAdmin(username)) return true; // global admin outranks everyone everywhere
+  const role = await serverMemberRole(username, serverId);
+  return role === 'admin' || role === 'owner';
 }
 
-function canManageServer(username, serverId) {
-  const srv = getServerStmt.get(serverId);
+async function canManageServer(username, serverId) {
+  const srv = await getServerById(serverId);
   if (!srv) return false;
-  if (isAdmin(username)) return true;
+  if (await isAdmin(username)) return true;
   if (srv.is_default) return false; // default server is global-admin-managed only
   if (srv.owner === username) return true;
-  return serverMemberRole(username, serverId) === 'admin';
+  return (await serverMemberRole(username, serverId)) === 'admin';
 }
 
 // Stricter than canManageServer: only the owner or a global admin can
 // delete the server, change ownership-level settings, or touch the owner.
-function isServerOwnerLevel(username, serverId) {
-  const srv = getServerStmt.get(serverId);
+async function isServerOwnerLevel(username, serverId) {
+  const srv = await getServerById(serverId);
   if (!srv) return false;
-  return isAdmin(username) || srv.owner === username;
+  return (await isAdmin(username)) || srv.owner === username;
 }
 
-function serversForUser(username) {
-  const rows = db.prepare(`
-    SELECT s.* FROM servers s
-    WHERE s.is_default = 1
-       OR s.id IN (SELECT server_id FROM server_members WHERE username = ?)
-    ORDER BY s.is_default DESC, s.id ASC
-  `).all(username);
+async function serversForUser(username) {
+  const rows = await q(
+    `SELECT s.* FROM servers s
+     WHERE s.is_default = 1
+        OR s.id IN (SELECT server_id FROM server_members WHERE username = $1)
+     ORDER BY s.is_default DESC, s.id ASC`,
+    [username]
+  );
 
-  return rows.map(s => ({
-    id: s.id,
-    name: s.name,
-    owner: s.owner,
-    iconUrl: s.icon_url || '',
-    isDefault: !!s.is_default,
-    isOwner: s.owner === username,
-    isServerAdmin: isServerAdmin(username, s.id),
-    canManage: canManageServer(username, s.id),
-    canManageOwnerLevel: isServerOwnerLevel(username, s.id),
-    inviteCode: (s.owner === username || isAdmin(username) || !s.is_default) ? s.invite_code : '',
-    channels: getChannelsForServer.all(s.id).map(c => ({
-      id: c.id,
-      serverId: c.server_id,
-      name: c.name,
-      room: c.room,
-      topic: c.topic || ''
-    }))
-  }));
+  const out = [];
+  for (const s of rows) {
+    const channels = await getChannelsForServer(s.id);
+    out.push({
+      id: s.id,
+      name: s.name,
+      owner: s.owner,
+      iconUrl: s.icon_url || '',
+      isDefault: !!s.is_default,
+      isOwner: s.owner === username,
+      isServerAdmin: await isServerAdmin(username, s.id),
+      canManage: await canManageServer(username, s.id),
+      canManageOwnerLevel: await isServerOwnerLevel(username, s.id),
+      inviteCode: (s.owner === username || (await isAdmin(username)) || !s.is_default) ? s.invite_code : '',
+      channels: channels.map(c => ({
+        id: c.id,
+        serverId: c.server_id,
+        name: c.name,
+        room: c.room,
+        topic: c.topic || ''
+      }))
+    });
+  }
+  return out;
 }
 
-function serverMemberUsernames(serverId) {
-  const srv = getServerStmt.get(serverId);
+async function serverMemberUsernames(serverId) {
+  const srv = await getServerById(serverId);
   if (!srv) return [];
-  if (srv.is_default) return db.prepare(`SELECT username FROM users WHERE banned = 0`).all().map(r => r.username);
-  return db.prepare(`SELECT username FROM server_members WHERE server_id = ?`).all(serverId).map(r => r.username);
+  if (srv.is_default) return (await q(`SELECT username FROM users WHERE banned = 0`)).map(r => r.username);
+  return (await q(`SELECT username FROM server_members WHERE server_id = $1`, [serverId])).map(r => r.username);
 }
 
-function notifyServerMembers(serverId, event, payload) {
-  for (const member of serverMemberUsernames(serverId)) sendToUser(member, event, payload);
+async function notifyServerMembers(serverId, event, payload) {
+  for (const member of await serverMemberUsernames(serverId)) sendToUser(member, event, payload);
 }
 
 // Can this user moderate (delete other people's messages, etc.) in this
 // room? True for a global admin anywhere, or a server admin/owner inside
 // their own server's channels. DMs and group chats aren't moderated by
 // server admins - only a global admin can act there.
-function canModerateRoom(username, room) {
-  if (isAdmin(username)) return true;
-  const channel = getChannelByRoomStmt.get(room);
+async function canModerateRoom(username, room) {
+  if (await isAdmin(username)) return true;
+  const channel = await getChannelByRoom(room);
   if (channel) return isServerAdmin(username, channel.server_id);
   return false;
 }
 
 // Every room a user is entitled to sit in, so unread badges work for channels
 // they are not currently looking at.
-function allRoomsFor(username) {
+async function allRoomsFor(username) {
   const rooms = [];
-  for (const s of db.prepare(`SELECT id, is_default FROM servers`).all()) {
-    if (s.is_default || isServerMember(username, s.id)) {
-      for (const c of getChannelsForServer.all(s.id)) rooms.push(c.room);
+  const servers = await q(`SELECT id, is_default FROM servers`);
+  for (const s of servers) {
+    if (s.is_default || (await isServerMember(username, s.id))) {
+      for (const c of await getChannelsForServer(s.id)) rooms.push(c.room);
     }
   }
-  for (const g of db.prepare(`SELECT group_id FROM group_members WHERE username = ?`).all(username)) {
-    rooms.push('group:' + g.group_id);
-  }
+  const groupRows = await q(`SELECT group_id FROM group_members WHERE username = $1`, [username]);
+  for (const g of groupRows) rooms.push('group:' + g.group_id);
   return rooms;
 }
 
-function isAllowedRoom(username, room) {
+async function isAllowedRoom(username, room) {
   if (!username || !room) return false;
-  const user = getUser.get(username);
+  const user = await getUser(username);
   if (!user || user.banned) return false;
 
-  const channel = getChannelByRoomStmt.get(room);
+  const channel = await getChannelByRoom(room);
   if (channel) return isServerMember(username, channel.server_id);
 
   const dmUsers = getDMUsers(room);
@@ -603,56 +647,54 @@ function getDMOtherUser(username, room) {
   return users.find(u => u !== username) || null;
 }
 
-function getMute(username) {
-  return db.prepare(`SELECT * FROM mutes WHERE username = ?`).get(username);
+async function getMute(username) {
+  return one(`SELECT * FROM mutes WHERE username = $1`, [username]);
 }
 
-function isMuted(username) {
-  const mute = getMute(username);
+async function isMuted(username) {
+  const mute = await getMute(username);
   if (!mute) return false;
-  const until = new Date(String(mute.muted_until).replace(' ', 'T') + 'Z');
+  const until = new Date(mute.muted_until);
   if (!isNaN(until) && until > new Date()) return mute;
-  db.prepare(`DELETE FROM mutes WHERE username = ?`).run(username);
+  await pool.query(`DELETE FROM mutes WHERE username = $1`, [username]);
   return false;
 }
 
-function profileFor(username) {
-  const u = getUser.get(username);
+async function profileFor(username) {
+  const u = await getUser(username);
   if (!u) return null;
   return {
     username: u.username,
     displayName: u.display_name || u.username,
     avatarUrl: u.avatar_url || '',
-    isAdmin: isAdmin(u.username)
+    isAdmin: await isAdmin(u.username)
   };
 }
 
 // Author details travel with every message so a client never has to guess an
 // avatar from a stale local cache.
-function authorFields(username) {
-  const u = getUser.get(username);
+async function authorFields(username) {
+  const u = await getUser(username);
   return {
     displayName: u ? (u.display_name || u.username) : username,
     avatarUrl: u ? (u.avatar_url || '') : ''
   };
 }
 
-function reactionSummary(messageId) {
-  const rows = db.prepare(`
-    SELECT emoji, COUNT(*) AS count, GROUP_CONCAT(username) AS users
-    FROM message_reactions
-    WHERE message_id = ?
-    GROUP BY emoji
-    ORDER BY emoji
-  `).all(messageId);
-  return rows.map(r => ({ emoji: r.emoji, count: r.count, users: r.users ? r.users.split(',') : [] }));
+async function reactionSummary(messageId) {
+  const rows = await q(
+    `SELECT emoji, COUNT(*) AS count, STRING_AGG(username, ',') AS users
+     FROM message_reactions WHERE message_id = $1 GROUP BY emoji ORDER BY emoji`,
+    [messageId]
+  );
+  return rows.map(r => ({ emoji: r.emoji, count: Number(r.count), users: r.users ? r.users.split(',') : [] }));
 }
 
-function replyPreview(id) {
+async function replyPreview(id) {
   if (!id) return null;
-  const row = getMessageById.get(id);
+  const row = await getMessageById(id);
   if (!row) return null;
-  const author = authorFields(row.user);
+  const author = await authorFields(row.user);
   return {
     id: row.id,
     user: row.user,
@@ -662,10 +704,10 @@ function replyPreview(id) {
   };
 }
 
-function normaliseMessage(row) {
+async function normaliseMessage(row) {
   if (!row) return null;
   const deleted = !!row.deleted_at;
-  const author = authorFields(row.user);
+  const author = await authorFields(row.user);
   return {
     id: row.id,
     room: row.room,
@@ -676,18 +718,18 @@ function normaliseMessage(row) {
     to: row.to_user || '',
     dmTo: row.to_user || '',
     isGroup: !!row.is_group,
-    replyTo: replyPreview(row.reply_to),
+    replyTo: await replyPreview(row.reply_to),
     editedAt: row.edited_at || '',
     deleted,
     deletedBy: row.deleted_by || '',
-    reactions: reactionSummary(row.id),
+    reactions: await reactionSummary(row.id),
     createdAt: row.created_at
   };
 }
 
-function normaliseFile(row) {
+async function normaliseFile(row) {
   if (!row) return null;
-  const author = authorFields(row.user);
+  const author = await authorFields(row.user);
   return {
     id: row.id,
     room: row.room,
@@ -700,7 +742,7 @@ function normaliseFile(row) {
     fileName: row.file_name,
     fileType: row.file_type || '',
     fileUrl: row.file_url,
-    fileSize: row.file_size || 0,
+    fileSize: Number(row.file_size || 0),
     caption: row.caption || '',
     createdAt: row.created_at
   };
@@ -716,12 +758,10 @@ function emitRoomOrDM(room, toUser, event, payload) {
   }
 }
 
-function removeOldFiles() {
-  const oldFiles = db.prepare(`
-    SELECT id, file_url
-    FROM files
-    WHERE created_at <= datetime('now', '-${FILE_EXPIRY_HOURS} hours')
-  `).all();
+async function removeOldFiles() {
+  const oldFiles = await q(
+    `SELECT id, file_url FROM files WHERE created_at <= NOW() - INTERVAL '${FILE_EXPIRY_HOURS} hours'`
+  );
 
   for (const file of oldFiles) {
     if (!file.file_url) continue;
@@ -733,10 +773,8 @@ function removeOldFiles() {
     }
   }
 
-  db.prepare(`DELETE FROM files WHERE created_at <= datetime('now', '-${FILE_EXPIRY_HOURS} hours')`).run();
+  await pool.query(`DELETE FROM files WHERE created_at <= NOW() - INTERVAL '${FILE_EXPIRY_HOURS} hours'`);
 }
-setInterval(removeOldFiles, 60 * 1000);
-removeOldFiles();
 
 function safeFileName(originalName) {
   return path.basename(String(originalName || 'file'))
@@ -782,8 +820,53 @@ function saveUploadStream(req, fullPath, maxBytes) {
   });
 }
 
+// Buffers a request body up to maxBytes and returns it as a Buffer. Used
+// for avatar/icon uploads, which are stored as data: URIs in Postgres
+// rather than written to disk.
+function bufferUploadStream(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let finished = false;
+
+    function cleanup(err) {
+      if (finished) return;
+      finished = true;
+      reject(err);
+    }
+
+    req.on('data', chunk => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        cleanup(new Error('file is too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (finished) return;
+      finished = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('aborted', () => cleanup(new Error('upload cancelled')));
+    req.on('error', cleanup);
+  });
+}
+
+// Wraps an async route handler so a thrown error / rejected promise becomes
+// a clean 500 instead of crashing the process or hanging the request.
+function route(handler) {
+  return (req, res) => {
+    Promise.resolve(handler(req, res)).catch(err => {
+      console.error(err);
+      if (!res.headersSent) res.status(500).json({ error: 'server error' });
+    });
+  };
+}
+
 // ---------------- HTTP ROUTES ----------------
-app.post('/register', (req, res) => {
+app.post('/register', route(async (req, res) => {
   const username = cleanUsername(req.body.username);
   const password = String(req.body.password || '');
   if (!username || !password) return res.status(400).json({ error: 'missing fields' });
@@ -792,20 +875,20 @@ app.post('/register', (req, res) => {
 
   try {
     const hash = bcrypt.hashSync(password, 10);
-    createUser.run(username, hash, username);
+    await createUser(username, hash, username);
     const token = createToken(username);
-    res.status(201).json({ message: 'ok', username, token, profile: profileFor(username) });
+    res.status(201).json({ message: 'ok', username, token, profile: await profileFor(username) });
   } catch (_) {
     res.status(409).json({ error: 'user exists' });
   }
-});
+}));
 
-app.post('/login', (req, res) => {
+app.post('/login', route(async (req, res) => {
   const username = cleanUsername(req.body.username);
   const password = String(req.body.password || '');
   if (!username || !password) return res.status(400).json({ error: 'missing fields' });
 
-  let user = getUser.get(username);
+  let user = await getUser(username);
 
   // No account with this username yet: create one on the spot instead of
   // rejecting the login, as long as AUTO_REGISTER_ON_LOGIN is turned on
@@ -815,12 +898,12 @@ app.post('/login', (req, res) => {
     if (password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
     try {
       const hash = bcrypt.hashSync(password, 10);
-      createUser.run(username, hash, username);
-      user = getUser.get(username);
+      await createUser(username, hash, username);
+      user = await getUser(username);
     } catch (_) {
       // Someone else raced us to create the same username - fall through
       // to the normal login check below using whatever now exists.
-      user = getUser.get(username);
+      user = await getUser(username);
     }
   }
 
@@ -829,28 +912,28 @@ app.post('/login', (req, res) => {
   if (!ok) return res.status(401).json({ error: 'invalid username or password' });
 
   const token = createToken(username);
-  res.json({ message: 'ok', username, token, profile: profileFor(username) });
-});
+  res.json({ message: 'ok', username, token, profile: await profileFor(username) });
+}));
 
-app.post('/logout', requireAuth, (req, res) => {
+app.post('/logout', requireAuth, route(async (req, res) => {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   if (token) tokens.delete(token);
   res.json({ message: 'ok' });
-});
+}));
 
-app.get('/profile', requireAuth, (req, res) => res.json(profileFor(req.username)));
+app.get('/profile', requireAuth, route(async (req, res) => res.json(await profileFor(req.username))));
 
-app.post('/profile', requireAuth, (req, res) => {
+app.post('/profile', requireAuth, route(async (req, res) => {
   const displayName = cleanText(req.body.displayName || req.username, 40) || req.username;
-  const avatarUrl = cleanText(req.body.avatarUrl || '', 800);
-  updateProfileStmt.run(displayName, avatarUrl, req.username);
-  const profile = profileFor(req.username);
+  const avatarUrl = cleanText(req.body.avatarUrl || '', 200000); // data: URIs can be long
+  await pool.query(`UPDATE users SET display_name = $1, avatar_url = $2 WHERE username = $3`, [displayName, avatarUrl, req.username]);
+  const profile = await profileFor(req.username);
   io.emit('profilesChanged', { username: req.username, profile });
   res.json(profile);
-});
+}));
 
-app.get('/profiles', requireAuth, (req, res) => {
+app.get('/profiles', requireAuth, route(async (req, res) => {
   const names = String(req.query.users || '')
     .split(',')
     .map(cleanUsername)
@@ -858,195 +941,207 @@ app.get('/profiles', requireAuth, (req, res) => {
     .slice(0, 200);
   const out = {};
   for (const name of names) {
-    const profile = profileFor(name);
+    const profile = await profileFor(name);
     if (profile) out[name] = profile;
   }
   res.json(out);
-});
+}));
 
-app.get('/users', requireAuth, (req, res) => {
-  const rows = db.prepare(`SELECT username FROM users WHERE banned = 0 ORDER BY username COLLATE NOCASE ASC LIMIT 500`).all();
-  res.json(rows.map(r => profileFor(r.username)).filter(Boolean));
-});
+app.get('/users', requireAuth, route(async (req, res) => {
+  const rows = await q(`SELECT username FROM users WHERE banned = 0 ORDER BY LOWER(username) ASC LIMIT 500`);
+  const profiles = [];
+  for (const r of rows) {
+    const p = await profileFor(r.username);
+    if (p) profiles.push(p);
+  }
+  res.json(profiles);
+}));
 
 // Legacy endpoint: channels of the default server.
-app.get('/channels', requireAuth, (req, res) => {
-  res.json(getChannelsForServer.all(DEFAULT_SERVER.id).map(c => ({ name: c.name, room: c.room, createdBy: c.created_by, createdAt: c.created_at })));
-});
+app.get('/channels', requireAuth, route(async (req, res) => {
+  const channels = await getChannelsForServer(DEFAULT_SERVER.id);
+  res.json(channels.map(c => ({ name: c.name, room: c.room, createdBy: c.created_by, createdAt: c.created_at })));
+}));
 
-app.get('/messages', requireAuth, (req, res) => {
+app.get('/messages', requireAuth, route(async (req, res) => {
   const room = String(req.query.room || 'general');
-  if (!isAllowedRoom(req.username, room)) return res.status(403).json({ error: 'forbidden room' });
-  res.json(getMessages.all(room).map(normaliseMessage));
-});
+  if (!(await isAllowedRoom(req.username, room))) return res.status(403).json({ error: 'forbidden room' });
+  const rows = await getMessagesForRoom(room);
+  const out = [];
+  for (const row of rows) out.push(await normaliseMessage(row));
+  res.json(out);
+}));
 
-app.get('/files', requireAuth, (req, res) => {
+app.get('/files', requireAuth, route(async (req, res) => {
   const room = String(req.query.room || 'general');
-  if (!isAllowedRoom(req.username, room)) return res.status(403).json({ error: 'forbidden room' });
-  res.json(getFiles.all(room).map(normaliseFile));
-});
+  if (!(await isAllowedRoom(req.username, room))) return res.status(403).json({ error: 'forbidden room' });
+  const rows = await getFilesForRoom(room);
+  const out = [];
+  for (const row of rows) out.push(await normaliseFile(row));
+  res.json(out);
+}));
 
-app.get('/read-receipts', requireAuth, (req, res) => {
+app.get('/read-receipts', requireAuth, route(async (req, res) => {
   const room = String(req.query.room || '');
-  if (!isAllowedRoom(req.username, room)) return res.status(403).json({ error: 'forbidden room' });
-  const rows = db.prepare(`SELECT username, last_message_id, updated_at FROM read_receipts WHERE room = ?`).all(room);
+  if (!(await isAllowedRoom(req.username, room))) return res.status(403).json({ error: 'forbidden room' });
+  const rows = await q(`SELECT username, last_message_id, updated_at FROM read_receipts WHERE room = $1`, [room]);
   res.json(rows.map(r => ({ user: r.username, lastMessageId: r.last_message_id, updatedAt: r.updated_at })));
-});
+}));
 
 // ---------------- SERVERS ----------------
-app.get('/servers', requireAuth, (req, res) => {
-  res.json(serversForUser(req.username));
-});
+app.get('/servers', requireAuth, route(async (req, res) => {
+  res.json(await serversForUser(req.username));
+}));
 
-app.post('/servers', requireAuth, (req, res) => {
+app.post('/servers', requireAuth, route(async (req, res) => {
   const name = cleanText(req.body.name, 60);
-  const iconUrl = cleanText(req.body.iconUrl || '', 800);
+  const iconUrl = cleanText(req.body.iconUrl || '', 200000);
   if (!name) return res.status(400).json({ error: 'server name required' });
 
-  const result = db.prepare(`INSERT INTO servers (name, owner, icon_url, invite_code) VALUES (?, ?, ?, ?)`)
-    .run(name, req.username, iconUrl, makeInviteCode());
-  const serverId = Number(result.lastInsertRowid);
-  db.prepare(`INSERT OR IGNORE INTO server_members (server_id, username, role) VALUES (?, ?, 'owner')`).run(serverId, req.username);
-  insertServerChannel.run(serverId, 'general', `ch:${serverId}:general`, 0, req.username);
-  insertServerChannel.run(serverId, 'random', `ch:${serverId}:random`, 1, req.username);
+  const srv = await one(
+    `INSERT INTO servers (name, owner, icon_url, invite_code) VALUES ($1, $2, $3, $4) RETURNING *`,
+    [name, req.username, iconUrl, makeInviteCode()]
+  );
+  const serverId = srv.id;
+  await pool.query(`INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING`, [serverId, req.username]);
+  await insertServerChannel(serverId, 'general', `ch:${serverId}:general`, 0, req.username);
+  await insertServerChannel(serverId, 'random', `ch:${serverId}:random`, 1, req.username);
 
   sendToUser(req.username, 'serversChanged', {});
-  const srv = getServerStmt.get(serverId);
   res.status(201).json({ id: serverId, name, inviteCode: srv.invite_code });
-});
+}));
 
-app.post('/servers/join', requireAuth, (req, res) => {
+app.post('/servers/join', requireAuth, route(async (req, res) => {
   const code = cleanText(req.body.code, 40).toLowerCase();
-  const srv = getServerByCode.get(code);
+  const srv = await getServerByCode(code);
   if (!srv) return res.status(404).json({ error: 'invite code not found' });
-  db.prepare(`INSERT OR IGNORE INTO server_members (server_id, username, role) VALUES (?, ?, 'member')`).run(srv.id, req.username);
-  notifyServerMembers(srv.id, 'serversChanged', {});
+  await pool.query(`INSERT INTO server_members (server_id, username, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`, [srv.id, req.username]);
+  await notifyServerMembers(srv.id, 'serversChanged', {});
   res.json({ id: srv.id, name: srv.name });
-});
+}));
 
-app.post('/servers/:id/update', requireAuth, (req, res) => {
+app.post('/servers/:id/update', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
-  if (!canManageServer(req.username, serverId)) return res.status(403).json({ error: 'only the server owner can do that' });
-  const srv = getServerStmt.get(serverId);
+  if (!(await canManageServer(req.username, serverId))) return res.status(403).json({ error: 'only the server owner can do that' });
+  const srv = await getServerById(serverId);
   const name = cleanText(req.body.name || srv.name, 60) || srv.name;
-  const iconUrl = req.body.iconUrl === undefined ? srv.icon_url : cleanText(req.body.iconUrl || '', 800);
-  db.prepare(`UPDATE servers SET name = ?, icon_url = ? WHERE id = ?`).run(name, iconUrl, serverId);
-  notifyServerMembers(serverId, 'serversChanged', {});
+  const iconUrl = req.body.iconUrl === undefined ? srv.icon_url : cleanText(req.body.iconUrl || '', 200000);
+  await pool.query(`UPDATE servers SET name = $1, icon_url = $2 WHERE id = $3`, [name, iconUrl, serverId]);
+  await notifyServerMembers(serverId, 'serversChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/servers/:id/channels', requireAuth, (req, res) => {
+app.post('/servers/:id/channels', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
-  if (!canManageServer(req.username, serverId)) return res.status(403).json({ error: 'only the server owner can add channels' });
+  if (!(await canManageServer(req.username, serverId))) return res.status(403).json({ error: 'only the server owner can add channels' });
   const name = cleanText(req.body.name, 32).toLowerCase().replace(/^#/, '').replace(/\s+/g, '-');
   if (!validChannelName(name)) return res.status(400).json({ error: 'channel name must be 2-32 letters, numbers, hyphens or underscores' });
 
-  const srv = getServerStmt.get(serverId);
+  const srv = await getServerById(serverId);
   const room = srv.is_default ? name : `ch:${serverId}:${name}`;
-  if (getChannelByRoomStmt.get(room)) return res.status(409).json({ error: 'channel already exists' });
+  if (await getChannelByRoom(room)) return res.status(409).json({ error: 'channel already exists' });
 
   try {
-    const position = getChannelsForServer.all(serverId).length;
-    const result = insertServerChannel.run(serverId, name, room, position, req.username);
-    if (srv.is_default) { try { insertChannelStmt.run(name, req.username); } catch (_) {} }
-    notifyServerMembers(serverId, 'serversChanged', {});
-    res.status(201).json({ id: Number(result.lastInsertRowid), name, room, serverId });
+    const position = (await getChannelsForServer(serverId)).length;
+    const created = await insertServerChannel(serverId, name, room, position, req.username);
+    if (srv.is_default) { try { await insertChannel(name, req.username); } catch (_) {} }
+    await notifyServerMembers(serverId, 'serversChanged', {});
+    res.status(201).json({ id: created.id, name, room, serverId });
   } catch (_) {
     res.status(409).json({ error: 'channel already exists' });
   }
-});
+}));
 
-app.post('/servers/:id/channels/:channelId/delete', requireAuth, (req, res) => {
+app.post('/servers/:id/channels/:channelId/delete', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
   const channelId = Number(req.params.channelId);
-  if (!canManageServer(req.username, serverId)) return res.status(403).json({ error: 'only the server owner can delete channels' });
-  const channel = getChannelByIdStmt.get(channelId);
+  if (!(await canManageServer(req.username, serverId))) return res.status(403).json({ error: 'only the server owner can delete channels' });
+  const channel = await getChannelById(channelId);
   if (!channel || channel.server_id !== serverId) return res.status(404).json({ error: 'channel not found' });
   if (DEFAULT_CHANNELS.includes(channel.room)) return res.status(400).json({ error: 'default channels cannot be deleted' });
-  if (getChannelsForServer.all(serverId).length <= 1) return res.status(400).json({ error: 'a server needs at least one channel' });
+  if ((await getChannelsForServer(serverId)).length <= 1) return res.status(400).json({ error: 'a server needs at least one channel' });
 
-  db.prepare(`DELETE FROM server_channels WHERE id = ?`).run(channelId);
-  deleteChannelStmt.run(channel.name);
-  notifyServerMembers(serverId, 'serversChanged', {});
+  await pool.query(`DELETE FROM server_channels WHERE id = $1`, [channelId]);
+  await deleteChannelRow(channel.name);
+  await notifyServerMembers(serverId, 'serversChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/servers/:id/leave', requireAuth, (req, res) => {
+app.post('/servers/:id/leave', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
-  const srv = getServerStmt.get(serverId);
+  const srv = await getServerById(serverId);
   if (!srv) return res.status(404).json({ error: 'server not found' });
   if (srv.is_default) return res.status(400).json({ error: 'you cannot leave the general server' });
   if (srv.owner === req.username) return res.status(400).json({ error: 'the owner cannot leave their own server' });
-  db.prepare(`DELETE FROM server_members WHERE server_id = ? AND username = ?`).run(serverId, req.username);
+  await pool.query(`DELETE FROM server_members WHERE server_id = $1 AND username = $2`, [serverId, req.username]);
   sendToUser(req.username, 'serversChanged', {});
-  notifyServerMembers(serverId, 'serversChanged', {});
+  await notifyServerMembers(serverId, 'serversChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/servers/:id/delete', requireAuth, (req, res) => {
+app.post('/servers/:id/delete', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
-  const srv = getServerStmt.get(serverId);
+  const srv = await getServerById(serverId);
   if (!srv) return res.status(404).json({ error: 'server not found' });
   if (srv.is_default) return res.status(400).json({ error: 'the general server cannot be deleted' });
-  if (srv.owner !== req.username && !isAdmin(req.username)) return res.status(403).json({ error: 'only the server owner can delete this server' });
+  if (srv.owner !== req.username && !(await isAdmin(req.username))) return res.status(403).json({ error: 'only the server owner can delete this server' });
 
-  const members = serverMemberUsernames(serverId);
-  db.prepare(`DELETE FROM server_channels WHERE server_id = ?`).run(serverId);
-  db.prepare(`DELETE FROM server_members WHERE server_id = ?`).run(serverId);
-  db.prepare(`DELETE FROM servers WHERE id = ?`).run(serverId);
+  const members = await serverMemberUsernames(serverId);
+  await pool.query(`DELETE FROM server_channels WHERE server_id = $1`, [serverId]);
+  await pool.query(`DELETE FROM server_members WHERE server_id = $1`, [serverId]);
+  await pool.query(`DELETE FROM servers WHERE id = $1`, [serverId]);
   for (const member of members) sendToUser(member, 'serversChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.get('/servers/:id/members', requireAuth, (req, res) => {
+app.get('/servers/:id/members', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
-  if (!isServerMember(req.username, serverId)) return res.status(403).json({ error: 'forbidden' });
-  const srv = getServerStmt.get(serverId);
-  const names = serverMemberUsernames(serverId);
-  res.json(names.map(name => {
-    const profile = profileFor(name) || { username: name, displayName: name, avatarUrl: '', isAdmin: false };
-    return {
-      ...profile,
-      role: srv.owner === name ? 'owner' : (serverMemberRole(name, serverId) === 'admin' ? 'admin' : 'member'),
-      online: onlineUsers.has(name)
-    };
-  }).sort((a, b) => (b.online - a.online) || a.username.localeCompare(b.username)));
-});
+  if (!(await isServerMember(req.username, serverId))) return res.status(403).json({ error: 'forbidden' });
+  const srv = await getServerById(serverId);
+  const names = await serverMemberUsernames(serverId);
+  const out = [];
+  for (const name of names) {
+    const profile = (await profileFor(name)) || { username: name, displayName: name, avatarUrl: '', isAdmin: false };
+    const role = srv.owner === name ? 'owner' : ((await serverMemberRole(name, serverId)) === 'admin' ? 'admin' : 'member');
+    out.push({ ...profile, role, online: onlineUsers.has(name) });
+  }
+  out.sort((a, b) => (Number(b.online) - Number(a.online)) || a.username.localeCompare(b.username));
+  res.json(out);
+}));
 
 // Promote or demote a member to this server's "admin" role. Owner-level
 // only (owner or global admin) - a server admin cannot create more admins,
 // and nobody can touch the owner's own role through this endpoint.
-app.post('/servers/:id/members/:username/role', requireAuth, (req, res) => {
+app.post('/servers/:id/members/:username/role', requireAuth, route(async (req, res) => {
   const serverId = Number(req.params.id);
   const target = cleanUsername(req.params.username);
   const role = String(req.body.role || '').trim();
-  const srv = getServerStmt.get(serverId);
+  const srv = await getServerById(serverId);
   if (!srv) return res.status(404).json({ error: 'server not found' });
   if (srv.is_default) return res.status(400).json({ error: 'the general server does not have per-server admins - use site-wide admin instead' });
-  if (!isServerOwnerLevel(req.username, serverId)) return res.status(403).json({ error: 'only the server owner can change roles' });
+  if (!(await isServerOwnerLevel(req.username, serverId))) return res.status(403).json({ error: 'only the server owner can change roles' });
   if (target === srv.owner) return res.status(400).json({ error: 'the owner already manages this server' });
   if (!['admin', 'member'].includes(role)) return res.status(400).json({ error: 'role must be "admin" or "member"' });
-  if (!db.prepare(`SELECT 1 FROM server_members WHERE server_id = ? AND username = ?`).get(serverId, target)) {
+  if (!(await one(`SELECT 1 FROM server_members WHERE server_id = $1 AND username = $2`, [serverId, target]))) {
     return res.status(404).json({ error: 'user is not a member of this server' });
   }
 
-  db.prepare(`UPDATE server_members SET role = ? WHERE server_id = ? AND username = ?`).run(role, serverId, target);
-  notifyServerMembers(serverId, 'serversChanged', {});
+  await pool.query(`UPDATE server_members SET role = $1 WHERE server_id = $2 AND username = $3`, [role, serverId, target]);
+  await notifyServerMembers(serverId, 'serversChanged', {});
   sendToUser(target, 'adminNotice', {
     message: role === 'admin'
       ? `You have been made a server admin in ${srv.name}.`
       : `Your server admin permissions in ${srv.name} have been removed.`
   });
   res.json({ message: 'ok', role });
-});
+}));
 
 // ---------------- FRIENDS ----------------
-app.get('/friends', requireAuth, (req, res) => {
-  const rows = db.prepare(`
-    SELECT * FROM friendships
-    WHERE requester = ? OR addressee = ?
-    ORDER BY updated_at DESC
-  `).all(req.username, req.username);
+app.get('/friends', requireAuth, route(async (req, res) => {
+  const rows = await q(
+    `SELECT * FROM friendships WHERE requester = $1 OR addressee = $1 ORDER BY updated_at DESC`,
+    [req.username]
+  );
 
   res.json(rows.map(r => ({
     requester: r.requester,
@@ -1056,67 +1151,81 @@ app.get('/friends', requireAuth, (req, res) => {
     status: r.status,
     updatedAt: r.updated_at
   })));
-});
+}));
 
-app.post('/friends/request', requireAuth, (req, res) => {
+app.post('/friends/request', requireAuth, route(async (req, res) => {
   const to = cleanUsername(req.body.username);
   if (!validUsername(to) || to === req.username) return res.status(400).json({ error: 'invalid username' });
-  if (!getUser.get(to)) return res.status(404).json({ error: 'user not found' });
+  if (!(await getUser(to))) return res.status(404).json({ error: 'user not found' });
 
   const pair = [req.username, to].sort();
-  const existing = db.prepare(`SELECT * FROM friendships WHERE requester IN (?, ?) AND addressee IN (?, ?)`).get(pair[0], pair[1], pair[0], pair[1]);
+  const existing = await one(
+    `SELECT * FROM friendships WHERE requester IN ($1, $2) AND addressee IN ($1, $2)`,
+    [pair[0], pair[1]]
+  );
   if (existing && existing.status === 'blocked') return res.status(403).json({ error: 'friend request blocked' });
 
-  db.prepare(`
-    INSERT INTO friendships (requester, addressee, status, updated_at)
-    VALUES (?, ?, 'pending', datetime('now'))
-    ON CONFLICT(requester, addressee) DO UPDATE SET status='pending', updated_at=datetime('now')
-  `).run(req.username, to);
+  await pool.query(
+    `INSERT INTO friendships (requester, addressee, status, updated_at)
+     VALUES ($1, $2, 'pending', NOW())
+     ON CONFLICT (requester, addressee) DO UPDATE SET status = 'pending', updated_at = NOW()`,
+    [req.username, to]
+  );
   sendToUser(to, 'friendsChanged', {});
   res.json({ message: 'request sent' });
-});
+}));
 
-app.post('/friends/respond', requireAuth, (req, res) => {
+app.post('/friends/respond', requireAuth, route(async (req, res) => {
   const requester = cleanUsername(req.body.username);
   const action = String(req.body.action || '');
   if (!['accept', 'decline'].includes(action)) return res.status(400).json({ error: 'invalid action' });
-  const row = db.prepare(`SELECT * FROM friendships WHERE requester = ? AND addressee = ? AND status = 'pending'`).get(requester, req.username);
+  const row = await one(
+    `SELECT * FROM friendships WHERE requester = $1 AND addressee = $2 AND status = 'pending'`,
+    [requester, req.username]
+  );
   if (!row) return res.status(404).json({ error: 'friend request not found' });
   if (action === 'accept') {
-    db.prepare(`UPDATE friendships SET status='accepted', updated_at=datetime('now') WHERE requester = ? AND addressee = ?`).run(requester, req.username);
+    await pool.query(`UPDATE friendships SET status = 'accepted', updated_at = NOW() WHERE requester = $1 AND addressee = $2`, [requester, req.username]);
   } else {
-    db.prepare(`DELETE FROM friendships WHERE requester = ? AND addressee = ?`).run(requester, req.username);
+    await pool.query(`DELETE FROM friendships WHERE requester = $1 AND addressee = $2`, [requester, req.username]);
   }
   sendToUser(requester, 'friendsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/friends/remove', requireAuth, (req, res) => {
+app.post('/friends/remove', requireAuth, route(async (req, res) => {
   const other = cleanUsername(req.body.username);
-  db.prepare(`DELETE FROM friendships WHERE (requester = ? AND addressee = ?) OR (requester = ? AND addressee = ?)`).run(req.username, other, other, req.username);
+  await pool.query(
+    `DELETE FROM friendships WHERE (requester = $1 AND addressee = $2) OR (requester = $2 AND addressee = $1)`,
+    [req.username, other]
+  );
   sendToUser(other, 'friendsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/friends/block', requireAuth, (req, res) => {
+app.post('/friends/block', requireAuth, route(async (req, res) => {
   const other = cleanUsername(req.body.username);
   if (!validUsername(other) || other === req.username) return res.status(400).json({ error: 'invalid username' });
-  if (!getUser.get(other)) return res.status(404).json({ error: 'user not found' });
-  db.prepare(`DELETE FROM friendships WHERE (requester = ? AND addressee = ?) OR (requester = ? AND addressee = ?)`).run(req.username, other, other, req.username);
-  db.prepare(`INSERT INTO friendships (requester, addressee, status) VALUES (?, ?, 'blocked')`).run(req.username, other);
+  if (!(await getUser(other))) return res.status(404).json({ error: 'user not found' });
+  await pool.query(
+    `DELETE FROM friendships WHERE (requester = $1 AND addressee = $2) OR (requester = $2 AND addressee = $1)`,
+    [req.username, other]
+  );
+  await pool.query(`INSERT INTO friendships (requester, addressee, status) VALUES ($1, $2, 'blocked')`, [req.username, other]);
   sendToUser(other, 'friendsChanged', {});
   res.json({ message: 'blocked' });
-});
+}));
 
 // ---------------- GROUPS ----------------
-app.get('/groups', requireAuth, (req, res) => {
-  const groups = db.prepare(`
-    SELECT g.id, g.name, g.owner, g.icon_url, g.created_at
-    FROM chat_groups g
-    JOIN group_members gm ON gm.group_id = g.id
-    WHERE gm.username = ?
-    ORDER BY g.name COLLATE NOCASE ASC
-  `).all(req.username);
+app.get('/groups', requireAuth, route(async (req, res) => {
+  const groups = await q(
+    `SELECT g.id, g.name, g.owner, g.icon_url, g.created_at
+     FROM chat_groups g
+     JOIN group_members gm ON gm.group_id = g.id
+     WHERE gm.username = $1
+     ORDER BY LOWER(g.name) ASC`,
+    [req.username]
+  );
 
   res.json(groups.map(g => ({
     id: g.id,
@@ -1127,108 +1236,111 @@ app.get('/groups', requireAuth, (req, res) => {
     createdAt: g.created_at,
     isOwner: g.owner === req.username
   })));
-});
+}));
 
-app.post('/groups', requireAuth, (req, res) => {
+app.post('/groups', requireAuth, route(async (req, res) => {
   const name = cleanText(req.body.name, 60);
   const members = Array.isArray(req.body.members) ? req.body.members.map(cleanUsername).filter(Boolean) : [];
   if (!name) return res.status(400).json({ error: 'group name required' });
 
-  const result = db.prepare(`INSERT INTO chat_groups (name, owner) VALUES (?, ?)`).run(name, req.username);
-  const groupId = result.lastInsertRowid;
-  db.prepare(`INSERT OR IGNORE INTO group_members (group_id, username, role) VALUES (?, ?, 'owner')`).run(groupId, req.username);
+  const group = await one(`INSERT INTO chat_groups (name, owner) VALUES ($1, $2) RETURNING *`, [name, req.username]);
+  const groupId = group.id;
+  await pool.query(`INSERT INTO group_members (group_id, username, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING`, [groupId, req.username]);
 
-  const add = db.prepare(`INSERT OR IGNORE INTO group_members (group_id, username, role) VALUES (?, ?, 'member')`);
   for (const member of members) {
-    if (validUsername(member) && getUser.get(member)) add.run(groupId, member);
+    if (validUsername(member) && (await getUser(member))) {
+      await pool.query(`INSERT INTO group_members (group_id, username, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`, [groupId, member]);
+    }
   }
 
   io.emit('groupsChanged', {});
   res.status(201).json({ id: groupId, room: `group:${groupId}`, name });
-});
+}));
 
-app.post('/groups/:id/rename', requireAuth, (req, res) => {
+app.post('/groups/:id/rename', requireAuth, route(async (req, res) => {
   const groupId = Number(req.params.id);
   const name = cleanText(req.body.name, 60);
-  const group = getGroup(groupId);
-  if (!group || !isGroupMember(req.username, groupId)) return res.status(404).json({ error: 'group not found' });
-  if (group.owner !== req.username && !isAdmin(req.username)) return res.status(403).json({ error: 'only the group owner can rename this group' });
+  const group = await getGroup(groupId);
+  if (!group || !(await isGroupMember(req.username, groupId))) return res.status(404).json({ error: 'group not found' });
+  if (group.owner !== req.username && !(await isAdmin(req.username))) return res.status(403).json({ error: 'only the group owner can rename this group' });
   if (!name) return res.status(400).json({ error: 'group name required' });
-  db.prepare(`UPDATE chat_groups SET name = ? WHERE id = ?`).run(name, groupId);
+  await pool.query(`UPDATE chat_groups SET name = $1 WHERE id = $2`, [name, groupId]);
   io.to(`group:${groupId}`).emit('groupsChanged', {});
   io.emit('groupsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/groups/:id/members', requireAuth, (req, res) => {
+app.post('/groups/:id/members', requireAuth, route(async (req, res) => {
   const groupId = Number(req.params.id);
   const username = cleanUsername(req.body.username);
-  const group = getGroup(groupId);
-  if (!group || !isGroupMember(req.username, groupId)) return res.status(404).json({ error: 'group not found' });
-  if (group.owner !== req.username && !isAdmin(req.username)) return res.status(403).json({ error: 'only the group owner can add members' });
-  if (!validUsername(username) || !getUser.get(username)) return res.status(400).json({ error: 'user not found' });
-  db.prepare(`INSERT OR IGNORE INTO group_members (group_id, username, role) VALUES (?, ?, 'member')`).run(groupId, username);
+  const group = await getGroup(groupId);
+  if (!group || !(await isGroupMember(req.username, groupId))) return res.status(404).json({ error: 'group not found' });
+  if (group.owner !== req.username && !(await isAdmin(req.username))) return res.status(403).json({ error: 'only the group owner can add members' });
+  if (!validUsername(username) || !(await getUser(username))) return res.status(400).json({ error: 'user not found' });
+  await pool.query(`INSERT INTO group_members (group_id, username, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`, [groupId, username]);
   sendToUser(username, 'groupsChanged', {});
   io.to(`group:${groupId}`).emit('groupsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/groups/:id/remove-member', requireAuth, (req, res) => {
+app.post('/groups/:id/remove-member', requireAuth, route(async (req, res) => {
   const groupId = Number(req.params.id);
   const username = cleanUsername(req.body.username);
-  const group = getGroup(groupId);
-  if (!group || !isGroupMember(req.username, groupId)) return res.status(404).json({ error: 'group not found' });
+  const group = await getGroup(groupId);
+  if (!group || !(await isGroupMember(req.username, groupId))) return res.status(404).json({ error: 'group not found' });
   if (username === group.owner) return res.status(400).json({ error: 'cannot remove group owner' });
-  if (group.owner !== req.username && !isAdmin(req.username)) return res.status(403).json({ error: 'only the group owner can remove members' });
-  db.prepare(`DELETE FROM group_members WHERE group_id = ? AND username = ?`).run(groupId, username);
+  if (group.owner !== req.username && !(await isAdmin(req.username))) return res.status(403).json({ error: 'only the group owner can remove members' });
+  await pool.query(`DELETE FROM group_members WHERE group_id = $1 AND username = $2`, [groupId, username]);
   sendToUser(username, 'groupsChanged', {});
   io.to(`group:${groupId}`).emit('groupsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.post('/groups/:id/leave', requireAuth, (req, res) => {
+app.post('/groups/:id/leave', requireAuth, route(async (req, res) => {
   const groupId = Number(req.params.id);
-  const group = getGroup(groupId);
-  if (!group || !isGroupMember(req.username, groupId)) return res.status(404).json({ error: 'group not found' });
+  const group = await getGroup(groupId);
+  if (!group || !(await isGroupMember(req.username, groupId))) return res.status(404).json({ error: 'group not found' });
   if (group.owner === req.username) return res.status(400).json({ error: 'owner cannot leave. Remove members or rename instead.' });
-  db.prepare(`DELETE FROM group_members WHERE group_id = ? AND username = ?`).run(groupId, req.username);
+  await pool.query(`DELETE FROM group_members WHERE group_id = $1 AND username = $2`, [groupId, req.username]);
   io.to(`group:${groupId}`).emit('groupsChanged', {});
   res.json({ message: 'ok' });
-});
+}));
 
-app.get('/groups/:id/members', requireAuth, (req, res) => {
+app.get('/groups/:id/members', requireAuth, route(async (req, res) => {
   const groupId = Number(req.params.id);
-  if (!isGroupMember(req.username, groupId)) return res.status(403).json({ error: 'forbidden' });
-  const rows = db.prepare(`SELECT username, role FROM group_members WHERE group_id = ? ORDER BY username COLLATE NOCASE ASC`).all(groupId);
-  res.json(rows.map(r => ({ ...r, ...(profileFor(r.username) || {}) })));
-});
+  if (!(await isGroupMember(req.username, groupId))) return res.status(403).json({ error: 'forbidden' });
+  const rows = await q(`SELECT username, role FROM group_members WHERE group_id = $1 ORDER BY LOWER(username) ASC`, [groupId]);
+  const out = [];
+  for (const r of rows) out.push({ ...r, ...((await profileFor(r.username)) || {}) });
+  res.json(out);
+}));
 
 // ---------------- IMAGE UPLOAD (avatars / server icons) ----------------
-// Stored under /avatars so everyone loads the same file from this server.
-// That is what makes a profile picture visible to every other user instead of
-// only to the person who picked it.
-app.post('/upload-image', requireAuth, async (req, res) => {
+// Stored as a data: URI directly in Postgres (users.avatar_url /
+// servers.icon_url) instead of on local disk. That's what makes a profile
+// picture or server icon survive a Render free-tier restart - the database
+// is persistent, the local filesystem is not.
+app.post('/upload-image', requireAuth, route(async (req, res) => {
   const contentLength = Number(req.headers['content-length'] || 0);
-  if (contentLength > MAX_IMAGE_BYTES) return res.status(413).json({ error: 'image is too large. Maximum is 8MB.' });
+  if (contentLength > MAX_IMAGE_BYTES) return res.status(413).json({ error: 'image is too large. Maximum is 1.5MB.' });
 
   const fileType = cleanText(req.headers['x-file-type'] || '', 120).toLowerCase();
   if (!IMAGE_MIME.has(fileType)) return res.status(400).json({ error: 'only PNG, JPG, GIF, WEBP or AVIF images are allowed' });
 
-  const originalName = safeFileName(decodeURIComponent(String(req.headers['x-file-name'] || 'image')));
-  const ext = (path.extname(originalName) || '.' + fileType.split('/')[1]).slice(0, 16);
-  const storedName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
-  const fullPath = path.join(AVATAR_DIR, storedName);
-
   try {
-    const size = await saveUploadStream(req, fullPath, MAX_IMAGE_BYTES);
-    res.status(201).json({ url: `/avatars/${storedName}`, size });
+    const buffer = await bufferUploadStream(req, MAX_IMAGE_BYTES);
+    const dataUrl = `data:${fileType};base64,${buffer.toString('base64')}`;
+    res.status(201).json({ url: dataUrl, size: buffer.length });
   } catch (err) {
     if (!res.headersSent) res.status(err.message === 'file is too large' ? 413 : 400).json({ error: err.message || 'upload failed' });
   }
-});
+}));
 
 // ---------------- UPLOAD ----------------
-app.post('/upload', requireAuth, async (req, res) => {
+// General file sharing still writes to local disk (see the DATA_DIR note
+// at the top of this file) - large files don't belong in Postgres, and
+// this feature already expires after FILE_EXPIRY_HOURS regardless.
+app.post('/upload', requireAuth, route(async (req, res) => {
   const contentLength = Number(req.headers['content-length'] || 0);
   if (contentLength > MAX_FILE_BYTES) return res.status(413).json({ error: 'file is too large. Maximum is 10GB.' });
 
@@ -1239,20 +1351,20 @@ app.post('/upload', requireAuth, async (req, res) => {
   let caption = '';
   try { caption = cleanText(decodeURIComponent(String(req.headers['x-caption'] || '')), 1000); } catch (_) { caption = ''; }
 
-  if (!isAllowedRoom(req.username, room)) return res.status(403).json({ error: 'forbidden room' });
+  if (!(await isAllowedRoom(req.username, room))) return res.status(403).json({ error: 'forbidden room' });
 
   let finalRoom = room;
   let toUser = '';
   let isGroup = groupIdFromRoom(room) ? 1 : 0;
 
   if (to) {
-    if (!validUsername(to) || to === req.username || !getUser.get(to)) return res.status(400).json({ error: 'invalid recipient' });
+    if (!validUsername(to) || to === req.username || !(await getUser(to))) return res.status(400).json({ error: 'invalid recipient' });
     finalRoom = makeDMRoom(req.username, to);
     toUser = to;
     isGroup = 0;
   }
 
-  if (isMuted(req.username)) return res.status(403).json({ error: 'you are muted' });
+  if (await isMuted(req.username)) return res.status(403).json({ error: 'you are muted' });
 
   const ext = path.extname(originalName).slice(0, 16);
   const storedName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
@@ -1261,8 +1373,8 @@ app.post('/upload', requireAuth, async (req, res) => {
   try {
     const size = await saveUploadStream(req, fullPath, MAX_FILE_BYTES);
     const fileUrl = `/uploads/${storedName}`;
-    const result = insertFile.run(finalRoom, req.username, toUser || null, isGroup, originalName, fileType, fileUrl, size, caption || null);
-    const fileMsg = normaliseFile(getFileById.get(result.lastInsertRowid));
+    const created = await insertFile(finalRoom, req.username, toUser || null, isGroup, originalName, fileType, fileUrl, size, caption || null);
+    const fileMsg = await normaliseFile(await getFileById(created.id));
 
     if (toUser) {
       io.to(finalRoom).emit('dmFile', fileMsg);
@@ -1276,7 +1388,7 @@ app.post('/upload', requireAuth, async (req, res) => {
   } catch (err) {
     if (!res.headersSent) res.status(err.message === 'file is too large' ? 413 : 400).json({ error: err.message || 'upload failed' });
   }
-});
+}));
 
 app.set('io', io);
 
@@ -1284,10 +1396,12 @@ app.set('io', io);
 io.use((socket, next) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
   const username = tokens.get(token);
-  const user = username ? getUser.get(username) : null;
-  if (!user || user.banned) return next(new Error('not authenticated'));
-  socket.username = username;
-  next();
+  if (!username) return next(new Error('not authenticated'));
+  getUser(username).then(user => {
+    if (!user || user.banned) return next(new Error('not authenticated'));
+    socket.username = username;
+    next();
+  }).catch(() => next(new Error('not authenticated')));
 });
 
 // ---------------- SOCKET EVENTS ----------------
@@ -1295,22 +1409,21 @@ io.on('connection', (socket) => {
   addOnlineUser(socket.username, socket.id);
   io.emit('users', getOnlineUsers());
 
-  function syncRooms() {
+  async function syncRooms() {
     for (const room of socket.rooms) {
       if (room !== socket.id) socket.leave(room);
     }
-    for (const room of allRoomsFor(socket.username)) socket.join(room);
+    for (const room of await allRoomsFor(socket.username)) socket.join(room);
   }
   syncRooms();
 
   socket.on('syncRooms', (ack) => {
-    syncRooms();
-    if (typeof ack === 'function') ack({ message: 'ok' });
+    syncRooms().then(() => { if (typeof ack === 'function') ack({ message: 'ok' }); });
   });
 
-  socket.on('joinRoom', (room, ack) => {
+  socket.on('joinRoom', async (room, ack) => {
     room = String(room || 'general');
-    if (!isAllowedRoom(socket.username, room)) {
+    if (!(await isAllowedRoom(socket.username, room))) {
       if (typeof ack === 'function') ack({ error: 'forbidden room' });
       return;
     }
@@ -1318,54 +1431,54 @@ io.on('connection', (socket) => {
     if (typeof ack === 'function') ack({ message: 'ok' });
   });
 
-  socket.on('message', (data = {}, ack) => {
+  socket.on('message', async (data = {}, ack) => {
     const room = String(data.room || 'general');
     const text = cleanText(data.text, 4000);
     const replyTo = Number(data.replyTo || 0) || null;
-    const muted = isMuted(socket.username);
+    const muted = await isMuted(socket.username);
     if (muted) {
       if (typeof ack === 'function') ack({ error: 'you are muted until ' + muted.muted_until });
       return;
     }
-    if (!isAllowedRoom(socket.username, room) || getDMUsers(room)) {
+    if (!(await isAllowedRoom(socket.username, room)) || getDMUsers(room)) {
       if (typeof ack === 'function') ack({ error: 'forbidden room' });
       return;
     }
     if (!text) return;
 
-    const result = insertMessage.run(room, socket.username, text, null, groupIdFromRoom(room) ? 1 : 0, replyTo);
-    const msg = normaliseMessage(getMessageById.get(result.lastInsertRowid));
+    const created = await insertMessage(room, socket.username, text, null, groupIdFromRoom(room) ? 1 : 0, replyTo);
+    const msg = await normaliseMessage(created);
     io.to(room).emit('message', msg);
     if (typeof ack === 'function') ack({ message: 'ok', id: msg.id });
   });
 
-  socket.on('dmMessage', (data = {}, ack) => {
+  socket.on('dmMessage', async (data = {}, ack) => {
     const to = cleanUsername(data.to);
     const text = cleanText(data.text, 4000);
     const replyTo = Number(data.replyTo || 0) || null;
-    const muted = isMuted(socket.username);
+    const muted = await isMuted(socket.username);
     if (muted) {
       if (typeof ack === 'function') ack({ error: 'you are muted until ' + muted.muted_until });
       return;
     }
-    if (!validUsername(to) || to === socket.username || !getUser.get(to)) {
+    if (!validUsername(to) || to === socket.username || !(await getUser(to))) {
       if (typeof ack === 'function') ack({ error: 'invalid recipient' });
       return;
     }
     if (!text) return;
 
     const room = makeDMRoom(socket.username, to);
-    const result = insertMessage.run(room, socket.username, text, to, 0, replyTo);
-    const msg = normaliseMessage(getMessageById.get(result.lastInsertRowid));
+    const created = await insertMessage(room, socket.username, text, to, 0, replyTo);
+    const msg = await normaliseMessage(created);
     sendToUser(socket.username, 'dmMessage', msg);
     sendToUser(to, 'dmMessage', msg);
     if (typeof ack === 'function') ack({ message: 'ok', id: msg.id });
   });
 
-  socket.on('editMessage', (data = {}, ack) => {
+  socket.on('editMessage', async (data = {}, ack) => {
     const id = Number(data.id);
     const text = cleanText(data.text, 4000);
-    const row = getMessageById.get(id);
+    const row = await getMessageById(id);
     if (!row || row.deleted_at) {
       if (typeof ack === 'function') ack({ error: 'message not found' });
       return;
@@ -1375,89 +1488,90 @@ io.on('connection', (socket) => {
       return;
     }
     if (!text) return;
-    db.prepare(`UPDATE messages SET text = ?, edited_at = datetime('now') WHERE id = ?`).run(text, id);
-    const msg = normaliseMessage(getMessageById.get(id));
+    await pool.query(`UPDATE messages SET text = $1, edited_at = NOW() WHERE id = $2`, [text, id]);
+    const msg = await normaliseMessage(await getMessageById(id));
     emitRoomOrDM(msg.room, msg.to, 'messageUpdated', msg);
     if (typeof ack === 'function') ack({ message: 'ok' });
   });
 
-  socket.on('deleteMessage', (data = {}, ack) => {
+  socket.on('deleteMessage', async (data = {}, ack) => {
     const id = Number(data.id);
-    const row = getMessageById.get(id);
+    const row = await getMessageById(id);
     if (!row || row.deleted_at) {
       if (typeof ack === 'function') ack({ error: 'message not found' });
       return;
     }
-    if (row.user !== socket.username && !canModerateRoom(socket.username, row.room)) {
+    if (row.user !== socket.username && !(await canModerateRoom(socket.username, row.room))) {
       if (typeof ack === 'function') ack({ error: 'you can only delete your own messages' });
       return;
     }
-    db.prepare(`UPDATE messages SET deleted_at = datetime('now'), deleted_by = ? WHERE id = ?`).run(socket.username, id);
-    const msg = normaliseMessage(getMessageById.get(id));
+    await pool.query(`UPDATE messages SET deleted_at = NOW(), deleted_by = $1 WHERE id = $2`, [socket.username, id]);
+    const msg = await normaliseMessage(await getMessageById(id));
     emitRoomOrDM(msg.room, msg.to, 'messageDeleted', msg);
     if (typeof ack === 'function') ack({ message: 'ok' });
   });
 
-  socket.on('reactMessage', (data = {}, ack) => {
+  socket.on('reactMessage', async (data = {}, ack) => {
     const id = Number(data.id);
     const emoji = String(data.emoji || '');
-    const row = getMessageById.get(id);
-    if (!row || row.deleted_at || !REACTION_EMOJIS.has(emoji) || !isAllowedRoom(socket.username, row.room)) {
+    const row = await getMessageById(id);
+    if (!row || row.deleted_at || !REACTION_EMOJIS.has(emoji) || !(await isAllowedRoom(socket.username, row.room))) {
       if (typeof ack === 'function') ack({ error: 'invalid reaction' });
       return;
     }
-    const existing = db.prepare(`SELECT 1 FROM message_reactions WHERE message_id = ? AND username = ? AND emoji = ?`).get(id, socket.username, emoji);
+    const existing = await one(`SELECT 1 FROM message_reactions WHERE message_id = $1 AND username = $2 AND emoji = $3`, [id, socket.username, emoji]);
     if (existing) {
-      db.prepare(`DELETE FROM message_reactions WHERE message_id = ? AND username = ? AND emoji = ?`).run(id, socket.username, emoji);
+      await pool.query(`DELETE FROM message_reactions WHERE message_id = $1 AND username = $2 AND emoji = $3`, [id, socket.username, emoji]);
     } else {
-      db.prepare(`INSERT INTO message_reactions (message_id, username, emoji) VALUES (?, ?, ?)`).run(id, socket.username, emoji);
+      await pool.query(`INSERT INTO message_reactions (message_id, username, emoji) VALUES ($1, $2, $3)`, [id, socket.username, emoji]);
     }
-    const payload = { id, room: row.room, reactions: reactionSummary(id) };
+    const payload = { id, room: row.room, reactions: await reactionSummary(id) };
     emitRoomOrDM(row.room, row.to_user || '', 'reactionUpdated', payload);
     if (typeof ack === 'function') ack({ message: 'ok' });
   });
 
-  socket.on('markRead', (data = {}) => {
+  socket.on('markRead', async (data = {}) => {
     const room = String(data.room || '');
     const lastMessageId = Number(data.lastMessageId || 0);
-    if (!room || !lastMessageId || !isAllowedRoom(socket.username, room)) return;
-    db.prepare(`
-      INSERT INTO read_receipts (room, username, last_message_id, updated_at)
-      VALUES (?, ?, ?, datetime('now'))
-      ON CONFLICT(room, username) DO UPDATE SET
-        last_message_id = MAX(read_receipts.last_message_id, excluded.last_message_id),
-        updated_at = datetime('now')
-    `).run(room, socket.username, lastMessageId);
+    if (!room || !lastMessageId || !(await isAllowedRoom(socket.username, room))) return;
+    await pool.query(
+      `INSERT INTO read_receipts (room, username, last_message_id, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (room, username) DO UPDATE SET
+         last_message_id = GREATEST(read_receipts.last_message_id, EXCLUDED.last_message_id),
+         updated_at = NOW()`,
+      [room, socket.username, lastMessageId]
+    );
     const payload = { room, user: socket.username, lastMessageId };
     io.to(room).emit('readReceipt', payload);
     const other = getDMOtherUser(socket.username, room);
     if (other) sendToUser(other, 'readReceipt', payload);
   });
 
-  socket.on('typing', (data = {}) => {
+  socket.on('typing', async (data = {}) => {
     const room = String(data.room || '');
     const to = cleanUsername(data.to);
     if (to) {
       if (!validUsername(to) || to === socket.username) return;
       sendToUser(to, 'typing', { room: makeDMRoom(socket.username, to), to, user: socket.username });
-    } else if (isAllowedRoom(socket.username, room)) {
+    } else if (await isAllowedRoom(socket.username, room)) {
       socket.to(room).emit('typing', { room, user: socket.username });
     }
   });
 
-  socket.on('stopTyping', (data = {}) => {
+  socket.on('stopTyping', async (data = {}) => {
     const room = String(data.room || '');
     const to = cleanUsername(data.to);
     if (to) {
       if (!validUsername(to) || to === socket.username) return;
       sendToUser(to, 'stopTyping', { room: makeDMRoom(socket.username, to), to, user: socket.username });
-    } else if (isAllowedRoom(socket.username, room)) {
+    } else if (await isAllowedRoom(socket.username, room)) {
       socket.to(room).emit('stopTyping', { room, user: socket.username });
     }
   });
 
-  socket.on('adminAction', (data = {}, ack) => {
-    if (!isAdmin(socket.username)) {
+  socket.on('adminAction', async (data = {}, ack) => {
+    if (!(await isAdmin(socket.username))) {
       if (typeof ack === 'function') ack({ error: 'admin only' });
       return;
     }
@@ -1467,42 +1581,46 @@ io.on('connection', (socket) => {
       if (action === 'createChannel') {
         const name = cleanUsername(data.name).replace(/^#/, '');
         if (!validChannelName(name)) throw new Error('channel name must be 2-32 letters, numbers, hyphens or underscores');
-        if (getChannelByRoomStmt.get(name)) throw new Error('channel already exists');
-        insertChannelStmt.run(name, socket.username);
-        insertServerChannel.run(DEFAULT_SERVER.id, name, name, getChannelsForServer.all(DEFAULT_SERVER.id).length, socket.username);
+        if (await getChannelByRoom(name)) throw new Error('channel already exists');
+        await insertChannel(name, socket.username);
+        await insertServerChannel(DEFAULT_SERVER.id, name, name, (await getChannelsForServer(DEFAULT_SERVER.id)).length, socket.username);
         io.emit('serversChanged', {});
         if (typeof ack === 'function') ack({ message: 'channel created' });
       } else if (action === 'deleteChannel') {
         const name = cleanUsername(data.name).replace(/^#/, '');
         if (DEFAULT_CHANNELS.includes(name)) throw new Error('default channels cannot be deleted');
-        deleteChannelStmt.run(name);
-        db.prepare(`DELETE FROM server_channels WHERE server_id = ? AND name = ?`).run(DEFAULT_SERVER.id, name);
+        await deleteChannelRow(name);
+        await pool.query(`DELETE FROM server_channels WHERE server_id = $1 AND name = $2`, [DEFAULT_SERVER.id, name]);
         io.emit('serversChanged', {});
         if (typeof ack === 'function') ack({ message: 'channel deleted' });
       } else if (action === 'mute') {
         const user = cleanUsername(data.username);
         const minutes = Math.max(1, Math.min(Number(data.minutes || 60), 10080));
-        if (!getUser.get(user)) throw new Error('user not found');
-        const until = new Date(Date.now() + minutes * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
-        db.prepare(`INSERT INTO mutes (username, muted_until, muted_by) VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET muted_until=excluded.muted_until, muted_by=excluded.muted_by`).run(user, until, socket.username);
-        sendToUser(user, 'adminNotice', { message: `You have been muted until ${until} UTC.` });
+        if (!(await getUser(user))) throw new Error('user not found');
+        const until = new Date(Date.now() + minutes * 60 * 1000);
+        await pool.query(
+          `INSERT INTO mutes (username, muted_until, muted_by) VALUES ($1, $2, $3)
+           ON CONFLICT (username) DO UPDATE SET muted_until = EXCLUDED.muted_until, muted_by = EXCLUDED.muted_by`,
+          [user, until, socket.username]
+        );
+        sendToUser(user, 'adminNotice', { message: `You have been muted until ${until.toISOString()}.` });
         if (typeof ack === 'function') ack({ message: 'user muted' });
       } else if (action === 'unmute') {
         const user = cleanUsername(data.username);
-        db.prepare(`DELETE FROM mutes WHERE username = ?`).run(user);
+        await pool.query(`DELETE FROM mutes WHERE username = $1`, [user]);
         sendToUser(user, 'adminNotice', { message: 'You have been unmuted.' });
         if (typeof ack === 'function') ack({ message: 'user unmuted' });
       } else if (action === 'ban') {
         const user = cleanUsername(data.username);
         if (user === socket.username) throw new Error('you cannot ban yourself');
-        if (!getUser.get(user)) throw new Error('user not found');
-        db.prepare(`UPDATE users SET banned = 1 WHERE username = ?`).run(user);
+        if (!(await getUser(user))) throw new Error('user not found');
+        await pool.query(`UPDATE users SET banned = 1 WHERE username = $1`, [user]);
         disconnectUser(user, 'You have been banned by admin.');
         io.emit('users', getOnlineUsers());
         if (typeof ack === 'function') ack({ message: 'user banned' });
       } else if (action === 'unban') {
         const user = cleanUsername(data.username);
-        db.prepare(`UPDATE users SET banned = 0 WHERE username = ?`).run(user);
+        await pool.query(`UPDATE users SET banned = 0 WHERE username = $1`, [user]);
         if (typeof ack === 'function') ack({ message: 'user unbanned' });
       } else if (action === 'kick') {
         const user = cleanUsername(data.username);
@@ -1515,9 +1633,9 @@ io.on('connection', (socket) => {
         const makeAdmin = !!data.isAdmin;
         if (user === socket.username) throw new Error('you cannot change your own admin status');
         if (user === 'Purple') throw new Error('Purple is always an admin and cannot be changed');
-        if (!getUser.get(user)) throw new Error('user not found');
-        setAdminStmt.run(makeAdmin ? 1 : 0, user);
-        const profile = profileFor(user);
+        if (!(await getUser(user))) throw new Error('user not found');
+        await setAdminFlag(user, makeAdmin);
+        const profile = await profileFor(user);
         io.emit('profilesChanged', { username: user, profile });
         sendToUser(user, 'adminNotice', { message: makeAdmin ? 'You have been made an admin.' : 'Your admin permissions have been removed.' });
         if (typeof ack === 'function') ack({ message: makeAdmin ? 'user promoted to admin' : 'user demoted' });
@@ -1535,6 +1653,23 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+// ---------------- BOOT ----------------
+async function main() {
+  await setupSchema();
+  DEFAULT_SERVER = await ensureDefaultServer();
+  for (const name of DEFAULT_CHANNELS) {
+    await pool.query(`INSERT INTO channels (name, created_by) VALUES ($1, 'system') ON CONFLICT (name) DO NOTHING`, [name]);
+  }
+  await applySeedAccounts();
+  setInterval(() => { removeOldFiles().catch(err => console.error('removeOldFiles failed:', err)); }, 60 * 1000);
+  await removeOldFiles();
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+main().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
