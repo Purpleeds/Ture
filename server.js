@@ -235,7 +235,33 @@ async function setupSchema() {
       muted_by TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    -- Login sessions used to live only in memory, which meant every Render
+    -- restart (sleeping from inactivity, or a redeploy) silently logged
+    -- everyone out - anyone whose browser still had an old token would get
+    -- "not authenticated" errors (e.g. avatar uploads failing) until they
+    -- refreshed and logged back in. Storing them here means a token keeps
+    -- working across restarts, same as everything else in Postgres.
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- Simple key/value store for site-wide settings (currently just the
+    -- global swear-word censor, toggleable only by Purple).
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
+
+  // These two tables already existed in earlier deployments, so the new
+  // censor_swears columns are added with ALTER TABLE rather than folded
+  // into the CREATE TABLE above - CREATE TABLE IF NOT EXISTS is a no-op on
+  // a table that's already there and would silently skip the new column.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS censor_swears INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE servers ADD COLUMN IF NOT EXISTS censor_swears INTEGER DEFAULT 0`);
 }
 
 // ---------------- SERVERS (guilds) ----------------
@@ -425,16 +451,35 @@ async function isAdmin(username) {
   return !!(user && user.is_admin);
 }
 
-function createToken(username) {
+async function createToken(username) {
   const token = crypto.randomBytes(32).toString('hex');
   tokens.set(token, username);
+  await pool.query(`INSERT INTO sessions (token, username) VALUES ($1, $2) ON CONFLICT (token) DO NOTHING`, [token, username]);
   return token;
+}
+
+// Checks the in-memory cache first (fast path for the common case), and
+// falls back to the sessions table on a miss - this is what lets a token
+// keep working after the server process restarts, since the in-memory
+// cache is empty right after a restart but the database isn't.
+async function usernameForToken(token) {
+  if (!token) return null;
+  if (tokens.has(token)) return tokens.get(token);
+  const row = await one(`SELECT username FROM sessions WHERE token = $1`, [token]);
+  if (!row) return null;
+  tokens.set(token, row.username);
+  return row.username;
+}
+
+async function deleteToken(token) {
+  tokens.delete(token);
+  await pool.query(`DELETE FROM sessions WHERE token = $1`, [token]);
 }
 
 async function authFromRequest(req) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const username = tokens.get(token) || null;
+  const username = await usernameForToken(token);
   if (!username) return null;
   const user = await getUser(username);
   if (!user || user.banned) return null;
@@ -574,6 +619,7 @@ async function serversForUser(username) {
       isServerAdmin: await isServerAdmin(username, s.id),
       canManage: await canManageServer(username, s.id),
       canManageOwnerLevel: await isServerOwnerLevel(username, s.id),
+      censorSwears: !!s.censor_swears,
       inviteCode: (s.owner === username || (await isAdmin(username)) || !s.is_default) ? s.invite_code : '',
       channels: channels.map(c => ({
         id: c.id,
@@ -667,7 +713,8 @@ async function profileFor(username) {
     username: u.username,
     displayName: u.display_name || u.username,
     avatarUrl: u.avatar_url || '',
-    isAdmin: await isAdmin(u.username)
+    isAdmin: await isAdmin(u.username),
+    censorSwears: !!u.censor_swears
   };
 }
 
@@ -876,7 +923,7 @@ app.post('/register', route(async (req, res) => {
   try {
     const hash = bcrypt.hashSync(password, 10);
     await createUser(username, hash, username);
-    const token = createToken(username);
+    const token = await createToken(username);
     res.status(201).json({ message: 'ok', username, token, profile: await profileFor(username) });
   } catch (_) {
     res.status(409).json({ error: 'user exists' });
@@ -911,14 +958,14 @@ app.post('/login', route(async (req, res) => {
   const ok = bcrypt.compareSync(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'invalid username or password' });
 
-  const token = createToken(username);
+  const token = await createToken(username);
   res.json({ message: 'ok', username, token, profile: await profileFor(username) });
 }));
 
 app.post('/logout', requireAuth, route(async (req, res) => {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (token) tokens.delete(token);
+  if (token) await deleteToken(token);
   res.json({ message: 'ok' });
 }));
 
@@ -928,6 +975,19 @@ app.post('/profile', requireAuth, route(async (req, res) => {
   const displayName = cleanText(req.body.displayName || req.username, 40) || req.username;
   const avatarUrl = cleanText(req.body.avatarUrl || '', 200000); // data: URIs can be long
   await pool.query(`UPDATE users SET display_name = $1, avatar_url = $2 WHERE username = $3`, [displayName, avatarUrl, req.username]);
+  const profile = await profileFor(req.username);
+  io.emit('profilesChanged', { username: req.username, profile });
+  res.json(profile);
+}));
+
+// Personal swear-word censor - a per-user display preference. Turning this
+// on only affects what this account sees; it never touches stored message
+// text. If a server-level or the site-wide global censor is already on,
+// the client greys this toggle out (see censorAppliesFor() in the
+// frontend) since censoring is already happening regardless of this flag.
+app.post('/settings/censor', requireAuth, route(async (req, res) => {
+  const enabled = req.body.enabled ? 1 : 0;
+  await pool.query(`UPDATE users SET censor_swears = $1 WHERE username = $2`, [enabled, req.username]);
   const profile = await profileFor(req.username);
   io.emit('profilesChanged', { username: req.username, profile });
   res.json(profile);
@@ -988,6 +1048,31 @@ app.get('/read-receipts', requireAuth, route(async (req, res) => {
   res.json(rows.map(r => ({ user: r.username, lastMessageId: r.last_message_id, updatedAt: r.updated_at })));
 }));
 
+// ---------------- SITE SETTINGS ----------------
+// One global on/off switch for the swear-word censor, applying to every
+// server and every user. Purple, and only Purple, can flip it - same as
+// Purple's permanent hardcoded global-admin status elsewhere in this file.
+async function getGlobalCensor() {
+  const row = await one(`SELECT value FROM site_settings WHERE key = 'global_censor_swears'`);
+  return !!(row && row.value === '1');
+}
+
+app.get('/site-settings', requireAuth, route(async (req, res) => {
+  res.json({ globalCensor: await getGlobalCensor() });
+}));
+
+app.post('/site-settings/global-censor', requireAuth, route(async (req, res) => {
+  if (req.username !== 'Purple') return res.status(403).json({ error: 'only Purple can change this' });
+  const enabled = req.body.enabled ? '1' : '0';
+  await pool.query(
+    `INSERT INTO site_settings (key, value) VALUES ('global_censor_swears', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [enabled]
+  );
+  io.emit('globalCensorChanged', { enabled: enabled === '1' });
+  res.json({ message: 'ok', enabled: enabled === '1' });
+}));
+
 // ---------------- SERVERS ----------------
 app.get('/servers', requireAuth, route(async (req, res) => {
   res.json(await serversForUser(req.username));
@@ -1027,6 +1112,19 @@ app.post('/servers/:id/update', requireAuth, route(async (req, res) => {
   const name = cleanText(req.body.name || srv.name, 60) || srv.name;
   const iconUrl = req.body.iconUrl === undefined ? srv.icon_url : cleanText(req.body.iconUrl || '', 200000);
   await pool.query(`UPDATE servers SET name = $1, icon_url = $2 WHERE id = $3`, [name, iconUrl, serverId]);
+  await notifyServerMembers(serverId, 'serversChanged', {});
+  res.json({ message: 'ok' });
+}));
+
+// Server-wide swear-word censor - anyone who can manage this server
+// (owner, a server admin, or a global admin) can turn this on so every
+// message in this server displays censored for every member, regardless
+// of anyone's personal setting.
+app.post('/servers/:id/censor', requireAuth, route(async (req, res) => {
+  const serverId = Number(req.params.id);
+  if (!(await canManageServer(req.username, serverId))) return res.status(403).json({ error: 'only a server admin or owner can change this' });
+  const enabled = req.body.enabled ? 1 : 0;
+  await pool.query(`UPDATE servers SET censor_swears = $1 WHERE id = $2`, [enabled, serverId]);
   await notifyServerMembers(serverId, 'serversChanged', {});
   res.json({ message: 'ok' });
 }));
@@ -1395,12 +1493,13 @@ app.set('io', io);
 // ---------------- SOCKET AUTH ----------------
 io.use((socket, next) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
-  const username = tokens.get(token);
-  if (!username) return next(new Error('not authenticated'));
-  getUser(username).then(user => {
-    if (!user || user.banned) return next(new Error('not authenticated'));
-    socket.username = username;
-    next();
+  usernameForToken(token).then(username => {
+    if (!username) return next(new Error('not authenticated'));
+    return getUser(username).then(user => {
+      if (!user || user.banned) return next(new Error('not authenticated'));
+      socket.username = username;
+      next();
+    });
   }).catch(() => next(new Error('not authenticated')));
 });
 
