@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { Server } = require('socket.io');
+const webpush = require('web-push');
 
 const app = express();
 const server = http.createServer(app);
@@ -253,6 +254,20 @@ async function setupSchema() {
     CREATE TABLE IF NOT EXISTS site_settings (
       key TEXT PRIMARY KEY,
       value TEXT
+    );
+
+    -- Web Push subscriptions, one row per browser/device a user has turned
+    -- push notifications on in. Lets the server wake a user up via the
+    -- browser's push service even when they have no tab open at all -
+    -- unlike the in-tab Notification feature, this survives the browser
+    -- being fully closed.
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
@@ -1073,6 +1088,111 @@ app.post('/site-settings/global-censor', requireAuth, route(async (req, res) => 
   res.json({ message: 'ok', enabled: enabled === '1' });
 }));
 
+// ---------------- WEB PUSH ----------------
+// VAPID keys identify this server to the browser push services. They're
+// generated once and stored in site_settings so they survive restarts -
+// if they changed on every restart, every existing subscription would
+// silently stop working and users would have to re-enable push.
+let vapidPublicKey = '';
+async function ensureVapidKeys() {
+  const pub = await one(`SELECT value FROM site_settings WHERE key = 'vapid_public_key'`);
+  const priv = await one(`SELECT value FROM site_settings WHERE key = 'vapid_private_key'`);
+  if (pub && priv) {
+    vapidPublicKey = pub.value;
+    webpush.setVapidDetails('mailto:admin@example.com', pub.value, priv.value);
+    return;
+  }
+  const keys = webpush.generateVAPIDKeys();
+  await pool.query(
+    `INSERT INTO site_settings (key, value) VALUES ('vapid_public_key', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [keys.publicKey]
+  );
+  await pool.query(
+    `INSERT INTO site_settings (key, value) VALUES ('vapid_private_key', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [keys.privateKey]
+  );
+  vapidPublicKey = keys.publicKey;
+  webpush.setVapidDetails('mailto:admin@example.com', keys.publicKey, keys.privateKey);
+}
+
+// Sends a real push notification (through the browser's push service) to
+// every device/browser `username` has subscribed on, but only ones that
+// are not currently connected here over Socket.IO - if they've got a tab
+// open, the in-tab notification feature already covers them, so this is
+// specifically for "the browser is fully closed" which in-tab notifications
+// can never reach. A push always says plainly it's from this chat app -
+// title/body are provided by the caller and are never disguised.
+async function sendPushToUser(username, payload) {
+  if (onlineUsers.has(username)) return; // already reachable live, skip push
+  if (!vapidPublicKey) return;
+  const subs = await q(`SELECT * FROM push_subscriptions WHERE username = $1`, [username]);
+  if (!subs.length) return;
+  const body = JSON.stringify(payload);
+  for (const sub of subs) {
+    const subscription = { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } };
+    try {
+      await webpush.sendNotification(subscription, body);
+    } catch (err) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        // Subscription is gone (browser data cleared, uninstalled, etc.) - clean it up.
+        await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [sub.endpoint]);
+      } else {
+        console.error('push send failed for', username, err.message);
+      }
+    }
+  }
+}
+
+// Finds @mentions in message text and pushes to any mentioned user who is
+// allowed in this room and not currently online - lets someone find out
+// they were mentioned even with the app fully closed, without pushing
+// every channel message to every member (which would be spammy).
+async function pushMentions(room, text, fromUser) {
+  const names = new Set();
+  const re = /@([a-zA-Z0-9_.-]{2,30})/g;
+  let match;
+  while ((match = re.exec(text))) names.add(match[1]);
+  if (!names.size) return;
+  const channel = await getChannelByRoom(room);
+  const roomLabel = channel ? channel.name : room;
+  for (const name of names) {
+    if (name === fromUser) continue;
+    const user = await getUser(name);
+    if (!user) continue;
+    if (!(await isAllowedRoom(name, room))) continue;
+    await sendPushToUser(name, {
+      title: `${fromUser} mentioned you in #${roomLabel}`,
+      body: text.slice(0, 140),
+      tag: 'mention:' + room,
+      url: '/'
+    });
+  }
+}
+
+app.get('/push/vapid-public-key', requireAuth, route(async (req, res) => {
+  res.json({ key: vapidPublicKey });
+}));
+
+app.post('/push/subscribe', requireAuth, route(async (req, res) => {
+  const sub = req.body.subscription;
+  if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+    return res.status(400).json({ error: 'invalid subscription' });
+  }
+  await pool.query(
+    `INSERT INTO push_subscriptions (username, endpoint, p256dh, auth) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (endpoint) DO UPDATE SET username = EXCLUDED.username, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+    [req.username, sub.endpoint, sub.keys.p256dh, sub.keys.auth]
+  );
+  res.json({ message: 'ok' });
+}));
+
+app.post('/push/unsubscribe', requireAuth, route(async (req, res) => {
+  const endpoint = String(req.body.endpoint || '');
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+  await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND username = $2`, [endpoint, req.username]);
+  res.json({ message: 'ok' });
+}));
+
 // ---------------- SERVERS ----------------
 app.get('/servers', requireAuth, route(async (req, res) => {
   res.json(await serversForUser(req.username));
@@ -1548,6 +1668,7 @@ io.on('connection', (socket) => {
     const created = await insertMessage(room, socket.username, text, null, groupIdFromRoom(room) ? 1 : 0, replyTo);
     const msg = await normaliseMessage(created);
     io.to(room).emit('message', msg);
+    pushMentions(room, text, socket.username).catch(err => console.error('pushMentions failed:', err.message));
     if (typeof ack === 'function') ack({ message: 'ok', id: msg.id });
   });
 
@@ -1571,6 +1692,12 @@ io.on('connection', (socket) => {
     const msg = await normaliseMessage(created);
     sendToUser(socket.username, 'dmMessage', msg);
     sendToUser(to, 'dmMessage', msg);
+    sendPushToUser(to, {
+      title: `${socket.username} sent you a message`,
+      body: text.slice(0, 140),
+      tag: 'dm:' + room,
+      url: '/'
+    }).catch(err => console.error('sendPushToUser failed:', err.message));
     if (typeof ack === 'function') ack({ message: 'ok', id: msg.id });
   });
 
@@ -1755,6 +1882,7 @@ io.on('connection', (socket) => {
 // ---------------- BOOT ----------------
 async function main() {
   await setupSchema();
+  await ensureVapidKeys();
   DEFAULT_SERVER = await ensureDefaultServer();
   for (const name of DEFAULT_CHANNELS) {
     await pool.query(`INSERT INTO channels (name, created_by) VALUES ($1, 'system') ON CONFLICT (name) DO NOTHING`, [name]);
