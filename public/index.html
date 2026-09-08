@@ -452,7 +452,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
   <div id="serverRail">
     <div class="railWrap home" id="homeRail" onclick="openHome()">
       <div class="railPill"></div>
-      <div class="railIcon">💬</div>
+      <div class="railIcon"><svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor"><path d="M4 4.5A1.5 1.5 0 0 1 5.5 3h13A1.5 1.5 0 0 1 20 4.5v11A1.5 1.5 0 0 1 18.5 17H10l-4.4 3.5A.8.8 0 0 1 4.3 20V17h-.8A1.5 1.5 0 0 1 2 15.5v-9A1.5 1.5 0 0 1 3.5 5H4v-.5z" transform="translate(1,0) scale(0.94)"/></svg></div>
       <div class="railBadge" id="homeBadge"></div>
       <div class="railTip">Direct Messages</div>
     </div>
@@ -465,7 +465,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
     </div>
     <div class="railWrap action" onclick="openJoinServer()">
       <div class="railPill"></div>
-      <div class="railIcon">🧭</div>
+      <div class="railIcon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M15.3 8.7l-2 5-5 2 2-5 5-2z" fill="currentColor"/></svg></div>
       <div class="railTip">Join a Server</div>
     </div>
   </div>
@@ -484,7 +484,13 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
           <div id="userPanelTag">Online</div>
         </div>
       </div>
-      <button class="panelBtn" title="User Settings" onclick="openSettings()">⚙</button>
+      <button class="panelBtn" title="User Settings" onclick="openSettings()"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+        <rect x="11" y="1.2" width="2" height="4" rx="1"/><rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(45 12 12)"/>
+        <rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(90 12 12)"/><rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(135 12 12)"/>
+        <rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(180 12 12)"/><rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(225 12 12)"/>
+        <rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(270 12 12)"/><rect x="11" y="1.2" width="2" height="4" rx="1" transform="rotate(315 12 12)"/>
+        <circle cx="12" cy="12" r="6.1" fill="none" stroke="currentColor" stroke-width="1.9"/><circle cx="12" cy="12" r="2.1"/>
+      </svg></button>
       <button class="panelBtn" title="Log Out" onclick="logout()">⏻</button>
     </div>
   </div>
@@ -542,6 +548,18 @@ let token = '';
 let username = '';
 let myProfile = { username:'', displayName:'', avatarUrl:'', isAdmin:false, censorSwears:false };
 let globalCensorEnabled = false; // site-wide censor, toggleable only by Purple
+
+const ICON_CHAT_SVG = '<svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor"><path d="M4 4.5A1.5 1.5 0 0 1 5.5 3h13A1.5 1.5 0 0 1 20 4.5v11A1.5 1.5 0 0 1 18.5 17H10l-4.4 3.5A.8.8 0 0 1 4.3 20V17h-.8A1.5 1.5 0 0 1 2 15.5v-9A1.5 1.5 0 0 1 3.5 5H4v-.5z" transform="translate(1,0) scale(0.94)"/></svg>';
+
+// Desktop notifications - a per-browser convenience (Notification
+// permission itself is granted per-browser, so this lives in localStorage
+// rather than the account profile). Only fires while this tab is open
+// somewhere but not the one the person is actively looking at - a fully
+// closed tab/browser can't run this code at all, so it can never fire in
+// that case without a full push-notification backend, which isn't what's
+// built here.
+let desktopNotificationsEnabled = false;
+try{ desktopNotificationsEnabled = localStorage.getItem('desktopNotifications') === '1'; }catch(e){}
 
 let servers = [];
 let currentServerId = null;
@@ -630,7 +648,15 @@ function formatBytes(bytes){
 }
 function parseTime(value){
   if(!value) return new Date();
-  const d = new Date(String(value).replace(' ', 'T') + 'Z');
+  const str = String(value);
+  // Postgres timestamps already arrive as full ISO strings (they contain
+  // "T"), so they parse directly. Only the old SQLite-style
+  // "YYYY-MM-DD HH:MM:SS" format (no "T", no timezone) needs help.
+  // Appending "Z" to an already-complete ISO string used to produce an
+  // invalid date, which silently fell back to "now" for every message -
+  // that's what was breaking both message order and the grouping/spacing
+  // of consecutive messages from the same person.
+  const d = str.includes('T') ? new Date(str) : new Date(str.replace(' ', 'T') + 'Z');
   return isNaN(d) ? new Date() : d;
 }
 function formatTime(value){
@@ -820,6 +846,7 @@ function cacheFromPayload(msg){
 
 function handleIncoming(msg, kind){
   cacheFromPayload(msg);
+  maybeNotifyDesktop(msg, kind, '#' + roomLabel(msg.room) + ' - ' + displayNameFor(msg.user));
   if(msg.room === currentRoom){
     appendItem({ kind, data:msg });
   }else{
@@ -831,11 +858,29 @@ function handleIncomingDM(msg, kind){
   cacheFromPayload(msg);
   const other = msg.user === username ? (msg.to || msg.dmTo) : msg.user;
   const room = msg.room || roomNameForDM(username, other);
+  maybeNotifyDesktop(msg, kind, displayNameFor(msg.user) + ' (DM)');
   if(room === currentRoom){
     appendItem({ kind, data:msg });
   }else if(msg.user !== username){
     bumpUnread(room, msg);
   }
+}
+
+// Shows a real, honestly-labeled desktop notification - it always says
+// which channel or DM it's from, never disguised as something else. Only
+// fires while this tab is open somewhere but isn't the one in front of
+// the person right now.
+function maybeNotifyDesktop(msg, kind, title){
+  if(!desktopNotificationsEnabled || !msg || msg.user === username) return;
+  if(typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  if(!(document.hidden || !document.hasFocus())) return;
+  try{
+    let body;
+    if(kind === 'file') body = displayNameFor(msg.user) + ' sent a file: ' + (msg.fileName || 'attachment');
+    else body = displayText(msg.text || '', msg.room).slice(0, 140) || (displayNameFor(msg.user) + ' sent a message');
+    const note = new Notification(title, { body });
+    note.onclick = () => { window.focus(); note.close(); };
+  }catch(e){}
 }
 
 function bumpUnread(room, msg){
@@ -1045,13 +1090,13 @@ function showHomePlaceholder(){
   currentRoom = '';
   activeDMUser = '';
   currentGroupRoom = '';
-  $('headerIcon').textContent = '💬';
+  $('headerIcon').innerHTML = ICON_CHAT_SVG;
   $('roomTitle').textContent = 'Direct Messages';
   $('roomTopic').textContent = '';
   resetTimeline();
   const block = document.createElement('div');
   block.className = 'welcomeBlock';
-  block.innerHTML = '<div class="welcomeIcon">💬</div><h1>Your messages</h1><p>Pick a person or a group chat on the left to start talking. Right-click someone in a member list to message them from anywhere.</p>';
+  block.innerHTML = '<div class="welcomeIcon">' + ICON_CHAT_SVG + '</div><h1>Your messages</h1><p>Pick a person or a group chat on the left to start talking. Right-click someone in a member list to message them from anywhere.</p>';
   innerEl().appendChild(block);
   setComposerEnabled(false);
   renderMembers();
@@ -1352,19 +1397,45 @@ function appendItem(item, bulk){
 }
 
 /* ============================ swear censor ============================ */
-// A simple whole-word censor for common profanity, applied only to how
+// A whole-word censor for profanity and slurs, applied only to how
 // messages are displayed - the actual stored text is never touched, so
 // nothing is lost and moderators can still see the original if needed.
-// Add or remove words here to tune the list; matching is case-insensitive
-// and whole-word only, so it won't fire on innocent words that merely
-// contain a shorter word as a substring.
+// Add or remove words here to tune the list.
 const CENSORED_WORDS = [
-  'fuck','fucking','fucker','fucked','shit','shitty','bullshit','bitch',
-  'bastard','asshole','ass','dumbass','damn','dammit','goddamn','crap',
-  'piss','pissed','dick','cock','pussy','slut','whore','bollocks',
-  'bugger','bloody','wanker','twat','douchebag','prick'
+  'fuck','fucking','fucker','fuckers','fucked','shit','shitty','shitting','bullshit',
+  'bitch','bitches','bastard','bastards','asshole','assholes','ass','dumbass',
+  'damn','dammit','goddamn','crap','piss','pissed','dick','dicks','cock','pussy',
+  'slut','sluts','whore','whores','bollocks','bugger','bloody','wanker','twat',
+  'douchebag','prick','nigger','niggers','nigga','niggas'
 ];
-const CENSOR_REGEX = new RegExp('\\b(' + CENSORED_WORDS.join('|') + ')\\b', 'gi');
+
+// Letters people commonly swap in to dodge a plain word-list filter
+// (leetspeak-style substitution), mapped to every character that should
+// be read as that letter.
+const LEET_SUBSTITUTIONS = { a:'a4@', e:'e3', i:'i1!|', o:'o0', s:'s5$', t:'t7' };
+
+function escapeForCharClass(chars){
+  return chars.replace(/[\]\\^-]/g, '\\$&');
+}
+
+// Builds one regex covering the whole list, where each word tolerates:
+// - substituted characters (the map above) instead of a real letter
+// - a stray space/symbol slipped between two letters ("f.u c-k")
+// - a letter repeated for emphasis ("fuuuck")
+// Word-boundary lookaround on both ends keeps it from firing inside an
+// unrelated word (e.g. never touches "class" or "assign" just because
+// they contain "ass"), while still catching the substituted spellings
+// people use specifically to get around a plain word-list filter.
+function buildCensorRegex(words){
+  const sep = '[^a-zA-Z0-9]{0,2}';
+  const patterns = words.map(word => {
+    const letters = word.split('').map(ch => '[' + escapeForCharClass(LEET_SUBSTITUTIONS[ch] || ch) + ']+');
+    return '(?<![a-zA-Z])' + letters.join(sep) + '(?![a-zA-Z])';
+  });
+  return new RegExp(patterns.join('|'), 'gi');
+}
+
+const CENSOR_REGEX = buildCensorRegex(CENSORED_WORDS);
 
 function censorText(text){
   return String(text || '').replace(CENSOR_REGEX, match => '*'.repeat(match.length));
@@ -1390,6 +1461,22 @@ function censorAppliesFor(room){
 
 function displayText(text, room){
   return censorAppliesFor(room) ? censorText(text) : String(text || '');
+}
+
+// Censoring text BEFORE it goes through renderMarkdown would let the
+// asterisks get reinterpreted as markdown bold/italic syntax (a run of
+// "*****" can get parsed as "**" + "*" + "**" and swallowed into a <b>
+// tag), corrupting the very thing meant to hide the word. So instead this
+// walks the already-rendered element's text nodes and censors those
+// directly - the asterisks land in the DOM as plain text, never passing
+// through the markdown parser again.
+function censorRenderedElement(el, room){
+  if(!censorAppliesFor(room)) return;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let node;
+  while((node = walker.nextNode())) nodes.push(node);
+  nodes.forEach(n => { n.nodeValue = censorText(n.nodeValue); });
 }
 
 function buildMessageEl(item, grouped){
@@ -1461,7 +1548,8 @@ function buildMessageEl(item, grouped){
   if(item.kind === 'message'){
     const text = document.createElement('div');
     text.className = 'msgText';
-    text.innerHTML = renderMarkdown(displayText(data.text, data.room));
+    text.innerHTML = renderMarkdown(data.text || '');
+    censorRenderedElement(text, data.room);
     if(data.editedAt){
       const edited = document.createElement('span');
       edited.className = 'edited';
@@ -1478,7 +1566,8 @@ function buildMessageEl(item, grouped){
     if(data.caption){
       const caption = document.createElement('div');
       caption.className = 'msgText imgCaption';
-      caption.innerHTML = renderMarkdown(displayText(data.caption, data.room));
+      caption.innerHTML = renderMarkdown(data.caption);
+      censorRenderedElement(caption, data.room);
       body.appendChild(caption);
     }
     body.appendChild(buildAttachment(data));
@@ -1665,7 +1754,8 @@ function applyUpdatedMessage(msg){
   if(!el) return;
   const text = el.querySelector('.msgText');
   if(text && !msg.deleted){
-    text.innerHTML = renderMarkdown(displayText(msg.text, msg.room));
+    text.innerHTML = renderMarkdown(msg.text || '');
+    censorRenderedElement(text, msg.room);
     if(msg.editedAt){
       const edited = document.createElement('span');
       edited.className = 'edited';
@@ -2365,6 +2455,13 @@ async function openSettings(){
         '<div class="modalNote">' + censorNote + '</div>' +
       '</div>' +
       globalSection +
+      '<div class="settingsRow">' +
+        '<label class="formLabel">Notifications</label>' +
+        '<label style="display:flex;align-items:center;gap:8px;font-weight:normal">' +
+        '<input type="checkbox" id="notifyToggle" style="width:auto"' + (desktopNotificationsEnabled ? ' checked' : '') + '> ' +
+        'Notify me on this device about new messages</label>' +
+        '<div class="modalNote">Only while a tab here is open somewhere (even minimized or in another tab) but not the one you\'re looking at - this can\'t reach you once the browser is fully closed. Notifications always clearly say which channel or DM they\'re from.</div>' +
+      '</div>' +
       '<div class="modalMsg" id="modalMsg"></div>' +
     '</div>' +
     '<div class="modalFoot"><button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" id="saveProfileBtn">Save Changes</button></div>'
@@ -2380,6 +2477,33 @@ async function openSettings(){
 
   const globalToggle = $('globalCensorToggle');
   if(globalToggle) globalToggle.onchange = () => setGlobalCensor(globalToggle.checked);
+
+  const notifyToggle = $('notifyToggle');
+  if(notifyToggle) notifyToggle.onchange = () => setDesktopNotifications(notifyToggle.checked, notifyToggle);
+}
+
+async function setDesktopNotifications(enabled, toggleEl){
+  if(!enabled){
+    desktopNotificationsEnabled = false;
+    try{ localStorage.setItem('desktopNotifications', '0'); }catch(e){}
+    toast('Desktop notifications turned off');
+    return;
+  }
+  if(typeof Notification === 'undefined'){
+    toast('Your browser does not support desktop notifications');
+    if(toggleEl) toggleEl.checked = false;
+    return;
+  }
+  let permission = Notification.permission;
+  if(permission === 'default') permission = await Notification.requestPermission();
+  if(permission !== 'granted'){
+    toast('Notifications are blocked - allow them for this site in your browser settings');
+    if(toggleEl) toggleEl.checked = false;
+    return;
+  }
+  desktopNotificationsEnabled = true;
+  try{ localStorage.setItem('desktopNotifications', '1'); }catch(e){}
+  toast('Desktop notifications turned on');
 }
 
 async function setPersonalCensor(enabled){
