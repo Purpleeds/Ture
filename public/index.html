@@ -540,7 +540,8 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 let socket = null;
 let token = '';
 let username = '';
-let myProfile = { username:'', displayName:'', avatarUrl:'', isAdmin:false };
+let myProfile = { username:'', displayName:'', avatarUrl:'', isAdmin:false, censorSwears:false };
+let globalCensorEnabled = false; // site-wide censor, toggleable only by Purple
 
 let servers = [];
 let currentServerId = null;
@@ -700,6 +701,12 @@ function completeLogin(returnedUsername, returnedToken, profile){
 
 async function logout(){
   try{ if(token) await fetch('/logout',{method:'POST',headers:authHeaders(),body:'{}'}); }catch(e){}
+  resetToLoginScreen('Logged out');
+}
+
+// Shared by a normal logout and by sessionExpired() below - clears local
+// state and shows the login screen with whatever message applies.
+function resetToLoginScreen(message){
   if(socket) socket.disconnect();
   token=''; username=''; activeDMUser=''; currentGroupRoom=''; currentRoom='general';
   servers=[]; groups=[]; groupByRoom={}; unread={}; pendingFiles=[]; replyTo=null;
@@ -707,29 +714,67 @@ async function logout(){
   innerEl().innerHTML='';
   $('app').classList.remove('ready');
   $('loginScreen').style.display = 'flex';
-  setStatus('Logged out');
+  setStatus(message);
 }
+
+// Called whenever a request comes back "not authenticated" while we
+// thought we were logged in - most commonly because the account was
+// banned, or because the server process restarted and this really is an
+// old/invalid token (session tokens themselves now survive restarts, so
+// this should be rare, but this keeps the failure mode friendly instead
+// of leaving people staring at a raw "not authenticated" error).
+let sessionExpiredHandled = false;
+function sessionExpired(){
+  if(sessionExpiredHandled || !token) return;
+  sessionExpiredHandled = true;
+  resetToLoginScreen('Your session ended - please log in again.');
+  setTimeout(() => { sessionExpiredHandled = false; }, 500);
+}
+
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async function(input, init){
+  const response = await nativeFetch(input, init);
+  if(response.status === 401 && token && init && init.headers && init.headers.Authorization){
+    sessionExpired();
+  }
+  return response;
+};
 
 /* ============================ sockets ============================ */
 function connectSocket(){
   socket = io({ auth:{ token } });
 
   socket.on('connect', async () => {
-    await Promise.all([loadServers(), loadGroups(), loadDirectory()]);
+    await Promise.all([loadServers(), loadGroups(), loadDirectory(), loadSiteSettings()]);
     socket.emit('syncRooms');
     const first = servers.find(s => s.isDefault) || servers[0];
     if(first) switchServer(first.id, true);
   });
-  socket.on('connect_error', err => setStatus(err.message || 'socket connection failed'));
+  socket.on('connect_error', err => {
+    if(err.message === 'not authenticated'){ sessionExpired(); return; }
+    setStatus(err.message || 'socket connection failed');
+  });
   socket.on('users', users => { onlineUserList = Array.isArray(users) ? users : []; renderMembers(); renderSidebar(); });
-  socket.on('serversChanged', async () => { await loadServers(); socket.emit('syncRooms'); renderRail(); renderSidebar(); });
+  socket.on('serversChanged', async () => {
+    await loadServers();
+    socket.emit('syncRooms');
+    renderRail();
+    renderSidebar();
+    if(currentRoom) loadHistory(currentRoom);
+  });
   socket.on('groupsChanged', async () => { await loadGroups(); socket.emit('syncRooms'); renderSidebar(); });
   socket.on('adminNotice', data => toast(data && data.message ? data.message : 'Admin notice'));
+
+  socket.on('globalCensorChanged', data => {
+    globalCensorEnabled = !!(data && data.enabled);
+    toast(globalCensorEnabled ? 'Site-wide swear censor turned on' : 'Site-wide swear censor turned off');
+    if(currentRoom) loadHistory(currentRoom);
+  });
 
   socket.on('profilesChanged', data => {
     if(data && data.username && data.profile){
       cacheProfile(data.username, data.profile);
-      if(data.username === username){ myProfile = data.profile; renderUserPanel(); }
+      if(data.username === username){ myProfile = data.profile; renderUserPanel(); if(currentRoom) loadHistory(currentRoom); }
       renderMembers();
       renderSidebar();
     }
@@ -831,6 +876,16 @@ async function loadDirectory(){
     if(!response.ok) return;
     directoryUsers = await response.json();
     directoryUsers.forEach(p => cacheProfile(p.username, p));
+  }catch(e){}
+}
+
+async function loadSiteSettings(){
+  if(!token) return;
+  try{
+    const response = await fetch('/site-settings', { headers: bearer() });
+    if(!response.ok) return;
+    const data = await response.json();
+    globalCensorEnabled = !!data.globalCensor;
   }catch(e){}
 }
 
@@ -1296,6 +1351,47 @@ function appendItem(item, bulk){
   }
 }
 
+/* ============================ swear censor ============================ */
+// A simple whole-word censor for common profanity, applied only to how
+// messages are displayed - the actual stored text is never touched, so
+// nothing is lost and moderators can still see the original if needed.
+// Add or remove words here to tune the list; matching is case-insensitive
+// and whole-word only, so it won't fire on innocent words that merely
+// contain a shorter word as a substring.
+const CENSORED_WORDS = [
+  'fuck','fucking','fucker','fucked','shit','shitty','bullshit','bitch',
+  'bastard','asshole','ass','dumbass','damn','dammit','goddamn','crap',
+  'piss','pissed','dick','cock','pussy','slut','whore','bollocks',
+  'bugger','bloody','wanker','twat','douchebag','prick'
+];
+const CENSOR_REGEX = new RegExp('\\b(' + CENSORED_WORDS.join('|') + ')\\b', 'gi');
+
+function censorText(text){
+  return String(text || '').replace(CENSOR_REGEX, match => '*'.repeat(match.length));
+}
+
+function serverForRoom(room){
+  for(const s of servers){
+    if((s.channels || []).some(c => c.room === room)) return s;
+  }
+  return null;
+}
+
+// Effective censorship for a given room: the site-wide switch (Purple
+// only) and a server's own switch (its owner/admins) both override
+// everyone's personal preference for messages in that room; otherwise it
+// comes down to whether this viewer turned it on for themselves.
+function censorAppliesFor(room){
+  if(globalCensorEnabled) return true;
+  const srv = serverForRoom(room);
+  if(srv && srv.censorSwears) return true;
+  return !!(myProfile && myProfile.censorSwears);
+}
+
+function displayText(text, room){
+  return censorAppliesFor(room) ? censorText(text) : String(text || '');
+}
+
 function buildMessageEl(item, grouped){
   const data = item.data;
   const wrap = document.createElement('div');
@@ -1335,7 +1431,7 @@ function buildMessageEl(item, grouped){
     reply.appendChild(who);
     const text = document.createElement('span');
     text.className = 'replyText';
-    text.textContent = data.replyTo.text || '';
+    text.textContent = displayText(data.replyTo.text, data.room);
     reply.appendChild(text);
     reply.onclick = () => jumpToMessage(data.replyTo.id);
     body.appendChild(reply);
@@ -1365,7 +1461,7 @@ function buildMessageEl(item, grouped){
   if(item.kind === 'message'){
     const text = document.createElement('div');
     text.className = 'msgText';
-    text.innerHTML = renderMarkdown(data.text || '');
+    text.innerHTML = renderMarkdown(displayText(data.text, data.room));
     if(data.editedAt){
       const edited = document.createElement('span');
       edited.className = 'edited';
@@ -1382,7 +1478,7 @@ function buildMessageEl(item, grouped){
     if(data.caption){
       const caption = document.createElement('div');
       caption.className = 'msgText imgCaption';
-      caption.innerHTML = renderMarkdown(data.caption);
+      caption.innerHTML = renderMarkdown(displayText(data.caption, data.room));
       body.appendChild(caption);
     }
     body.appendChild(buildAttachment(data));
@@ -1569,7 +1665,7 @@ function applyUpdatedMessage(msg){
   if(!el) return;
   const text = el.querySelector('.msgText');
   if(text && !msg.deleted){
-    text.innerHTML = renderMarkdown(msg.text || '');
+    text.innerHTML = renderMarkdown(displayText(msg.text, msg.room));
     if(msg.editedAt){
       const edited = document.createElement('span');
       edited.className = 'edited';
@@ -1784,7 +1880,8 @@ function uploadFile(file, caption){
     };
     xhr.onload = () => {
       $('uploadBar').style.width = '100%';
-      if(xhr.status < 200 || xhr.status >= 300){
+      if(xhr.status === 401){ sessionExpired(); }
+      else if(xhr.status < 200 || xhr.status >= 300){
         try{ showError(JSON.parse(xhr.responseText || '{}').error || 'Upload failed.'); }
         catch(e){ showError('Upload failed.'); }
       }
@@ -1803,13 +1900,14 @@ function uploadFile(file, caption){
 function uploadImageForProfile(file){
   return new Promise((resolve, reject) => {
     if(!file.type.startsWith('image/')) return reject(new Error('Please pick an image file.'));
-    if(file.size > 8 * 1024 * 1024) return reject(new Error('Image must be 8MB or smaller.'));
+    if(file.size > 1.5 * 1024 * 1024) return reject(new Error('Image must be 1.5MB or smaller.'));
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload-image');
     xhr.setRequestHeader('Authorization', 'Bearer ' + token);
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('X-File-Type', file.type);
     xhr.onload = () => {
+      if(xhr.status === 401){ sessionExpired(); reject(new Error('Your session ended - please log in again.')); return; }
       try{
         const data = JSON.parse(xhr.responseText || '{}');
         if(xhr.status >= 200 && xhr.status < 300) resolve(data.url);
@@ -2216,6 +2314,29 @@ function modalMessage(text, isError){
 
 async function openSettings(){
   const avatarUrl = avatarUrlFor(username);
+
+  // If a server-wide or the site-wide censor is already on, personal
+  // choice doesn't matter - messages show censored either way - so the
+  // toggle is shown forced-on and disabled rather than letting someone
+  // "turn off" something that's actually still happening.
+  const srv = currentServer();
+  const forcedByServer = !!(srv && srv.censorSwears);
+  const forcedByGlobal = globalCensorEnabled;
+  const censorForced = forcedByGlobal || forcedByServer;
+  const censorChecked = censorForced || !!myProfile.censorSwears;
+  const censorNote = forcedByGlobal
+    ? 'Turned on site-wide by Purple - this can\'t be turned off here.'
+    : (forcedByServer ? 'Turned on for "' + escapeHtml(srv.name) + '" by that server\'s admins - this can\'t be turned off here.'
+    : 'Only affects what you see - nobody else is affected by your choice.');
+
+  const globalSection = username === 'Purple'
+    ? '<div class="settingsRow"><label class="formLabel">Site-wide moderation (Purple only)</label>' +
+      '<label style="display:flex;align-items:center;gap:8px;font-weight:normal">' +
+      '<input type="checkbox" id="globalCensorToggle" style="width:auto"' + (globalCensorEnabled ? ' checked' : '') + '> ' +
+      'Censor swear words everywhere, for everyone</label>' +
+      '<div class="modalNote">Overrides every server and personal setting while it\'s on.</div></div>'
+    : '';
+
   openModal(
     '<div class="modalHead"><h2>My Account</h2><p>Your profile picture is stored on this server, so everyone in every chat sees the same image.</p></div>' +
     '<div class="modalBody">' +
@@ -2224,7 +2345,7 @@ async function openSettings(){
         '<div style="flex:1;min-width:180px">' +
           '<button class="btn" id="pickAvatarBtn">Upload Image</button> ' +
           '<button class="btn grey" id="clearAvatarBtn">Remove</button>' +
-          '<div class="modalNote">PNG, JPG, GIF or WEBP up to 8MB.</div>' +
+          '<div class="modalNote">PNG, JPG, GIF or WEBP up to 1.5MB.</div>' +
         '</div>' +
       '</div>' +
       '<div class="settingsRow">' +
@@ -2236,6 +2357,14 @@ async function openSettings(){
         '<input class="formInput" id="avatarUrlInput" placeholder="https://example.com/avatar.png" value="' + escapeHtml(avatarUrl) + '">' +
         '<div class="modalNote">Links from other sites can fail to load for other people — uploading is safer.</div>' +
       '</div>' +
+      '<div class="settingsRow">' +
+        '<label class="formLabel">Swear word censor</label>' +
+        '<label style="display:flex;align-items:center;gap:8px;font-weight:normal">' +
+        '<input type="checkbox" id="censorToggle" style="width:auto"' + (censorChecked ? ' checked' : '') + (censorForced ? ' disabled' : '') + '> ' +
+        'Censor swear words in chat</label>' +
+        '<div class="modalNote">' + censorNote + '</div>' +
+      '</div>' +
+      globalSection +
       '<div class="modalMsg" id="modalMsg"></div>' +
     '</div>' +
     '<div class="modalFoot"><button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" id="saveProfileBtn">Save Changes</button></div>'
@@ -2245,6 +2374,34 @@ async function openSettings(){
   $('pickAvatarBtn').onclick = pickAvatarFile;
   $('clearAvatarBtn').onclick = () => { $('avatarUrlInput').value = ''; saveProfile(); };
   $('saveProfileBtn').onclick = saveProfile;
+
+  const censorToggle = $('censorToggle');
+  if(censorToggle && !censorForced) censorToggle.onchange = () => setPersonalCensor(censorToggle.checked);
+
+  const globalToggle = $('globalCensorToggle');
+  if(globalToggle) globalToggle.onchange = () => setGlobalCensor(globalToggle.checked);
+}
+
+async function setPersonalCensor(enabled){
+  try{
+    const response = await fetch('/settings/censor', { method:'POST', headers:authHeaders(), body:JSON.stringify({ enabled }) });
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.error || 'could not save');
+    myProfile = data;
+    if(currentRoom) loadHistory(currentRoom);
+    toast(enabled ? 'Swear censor turned on for you' : 'Swear censor turned off for you');
+  }catch(err){ toast(err.message); }
+}
+
+async function setGlobalCensor(enabled){
+  try{
+    const response = await fetch('/site-settings/global-censor', { method:'POST', headers:authHeaders(), body:JSON.stringify({ enabled }) });
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.error || 'could not save');
+    globalCensorEnabled = !!data.enabled;
+    if(currentRoom) loadHistory(currentRoom);
+    toast(enabled ? 'Site-wide swear censor turned on' : 'Site-wide swear censor turned off');
+  }catch(err){ toast(err.message); }
 }
 
 function pickAvatarFile(){
@@ -2412,6 +2569,13 @@ function openServerSettings(serverId){
       '<div class="modalNote">Share this code — friends join with the compass button on the left.</div></div>' +
       '<div class="settingsRow"><label class="formLabel">Channels</label>' + channelRows +
       (server.canManage ? '<button class="btn grey" id="addChannelBtn" style="margin-top:6px">Create channel</button>' : '') + '</div>' +
+      (server.canManage
+        ? '<div class="settingsRow"><label class="formLabel">Moderation</label>' +
+          '<label style="display:flex;align-items:center;gap:8px;font-weight:normal">' +
+          '<input type="checkbox" id="serverCensorToggle" style="width:auto"' + (server.censorSwears ? ' checked' : '') + '> ' +
+          'Censor swear words for everyone in this server</label>' +
+          '<div class="modalNote">Overrides each member\'s personal setting while it\'s on.</div></div>'
+        : (server.censorSwears ? '<div class="settingsRow"><div class="modalNote">This server\'s admins have turned on the swear word censor for everyone here.</div></div>' : '')) +
       '<div class="modalMsg" id="modalMsg"></div>' +
     '</div>' +
     '<div class="modalFoot">' +
@@ -2450,6 +2614,19 @@ function openServerSettings(serverId){
 
   const addBtn = $('addChannelBtn');
   if(addBtn) addBtn.onclick = () => { closeModal(); switchServer(server.id); openCreateChannel(); };
+
+  const serverCensorToggle = $('serverCensorToggle');
+  if(serverCensorToggle) serverCensorToggle.onchange = async () => {
+    const enabled = serverCensorToggle.checked;
+    try{
+      const response = await fetch('/servers/' + server.id + '/censor', { method:'POST', headers:authHeaders(), body:JSON.stringify({ enabled }) });
+      const data = await response.json();
+      if(!response.ok) throw new Error(data.error || 'could not save');
+      await loadServers();
+      if(currentRoom) loadHistory(currentRoom);
+      toast(enabled ? 'Swear censor turned on for this server' : 'Swear censor turned off for this server');
+    }catch(err){ modalMessage(err.message, true); serverCensorToggle.checked = !enabled; }
+  };
 
   document.querySelectorAll('[data-del]').forEach(btn => {
     btn.onclick = async () => {
