@@ -190,7 +190,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .message.mentioned{background:rgba(250,168,26,.1);box-shadow:inset 2px 0 0 #faa81a;}
 .message.mentioned:hover{background:rgba(250,168,26,.16);}
 .msgGutter{width:40px;flex:0 0 40px;display:flex;justify-content:center;padding-top:2px;}
-.hoverTime{font-size:11px;color:var(--text-muted);opacity:0;line-height:22px;}
+.hoverTime{position:absolute;top:-6px;right:154px;font-size:11px;white-space:nowrap;color:var(--text-muted);opacity:0;line-height:1.2;}
 .message:hover .hoverTime{opacity:1;}
 .msgBody{flex:1;min-width:0;}
 .msgHead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;}
@@ -276,6 +276,16 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 /* composer */
 #composerArea{padding:0 16px 24px 16px;position:relative;}
 #composerBox{background:var(--composer);border-radius:8px;}
+.mentionAutocomplete{
+  position:absolute;left:16px;right:16px;bottom:100%;margin-bottom:8px;
+  background:#111214;border-radius:8px;box-shadow:0 8px 16px rgba(0,0,0,.24);
+  overflow:hidden;max-height:224px;overflow-y:auto;
+}
+.mentionItem{display:flex;align-items:center;gap:10px;padding:6px 12px;cursor:pointer;font-size:14px;color:var(--text);}
+.mentionItem.active,.mentionItem:hover{background:var(--brand);}
+.mentionName{font-weight:600;}
+.mentionUsername{color:var(--text-muted);font-size:12px;}
+.mentionItem.active .mentionUsername{color:rgba(255,255,255,.75);}
 #replyBar{
   display:none;align-items:center;justify-content:space-between;gap:8px;background:#2b2d31;
   border-radius:8px 8px 0 0;padding:8px 12px;font-size:13px;color:var(--text-muted);
@@ -506,6 +516,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
     <div id="messages"><div id="messagesInner"></div></div>
     <div id="typingIndicator"></div>
     <div id="composerArea">
+      <div id="mentionAutocomplete" class="mentionAutocomplete" hidden></div>
       <div id="composerBox">
         <div id="replyBar">
           <div>Replying to <b id="replyTarget"></b></div>
@@ -555,11 +566,19 @@ const ICON_CHAT_SVG = '<svg viewBox="0 0 24 24" width="26" height="26" fill="cur
 // permission itself is granted per-browser, so this lives in localStorage
 // rather than the account profile). Only fires while this tab is open
 // somewhere but not the one the person is actively looking at - a fully
-// closed tab/browser can't run this code at all, so it can never fire in
-// that case without a full push-notification backend, which isn't what's
-// built here.
+// closed tab/browser can't run this code at all, so that case is covered
+// separately by the push-notification feature below instead.
 let desktopNotificationsEnabled = false;
 try{ desktopNotificationsEnabled = localStorage.getItem('desktopNotifications') === '1'; }catch(e){}
+
+// Push notifications - reaches the person through the browser's own push
+// service, so (unlike the tab-based notifications above) it also works
+// with the browser fully closed. Sent only for DMs and @mentions, and
+// only when the recipient isn't already connected live, to avoid double-
+// notifying an active user. Always labeled honestly by the server - same
+// rule as the tab notifications.
+let pushNotificationsEnabled = false;
+try{ pushNotificationsEnabled = localStorage.getItem('pushNotifications') === '1'; }catch(e){}
 
 let servers = [];
 let currentServerId = null;
@@ -1387,7 +1406,11 @@ function appendItem(item, bulk){
 
   const grouped = shouldGroup(item, lastItem);
   const el = buildMessageEl(item, grouped);
-  const atBottom = isAtBottom();
+  // Always jump to the bottom for a message you just sent yourself, even
+  // if you'd scrolled up to read older history - the same way sending a
+  // message does in most chat apps, so you can see what you sent.
+  const isOwnLiveMessage = !bulk && item.data.user === username;
+  const atBottom = isAtBottom() || isOwnLiveMessage;
   innerEl().appendChild(el);
   lastItem = item;
   if(!bulk && atBottom) scrollToBottom();
@@ -1493,7 +1516,7 @@ function buildMessageEl(item, grouped){
     const time = document.createElement('span');
     time.className = 'hoverTime';
     time.textContent = formatTime(data.createdAt);
-    gutter.appendChild(time);
+    wrap.appendChild(time);
   }else{
     const avatar = createAvatar(data.user, '', { wrapClass:'onChat' });
     avatar.style.cursor = 'pointer';
@@ -1857,6 +1880,7 @@ function sendReaction(id, emoji){
 
 async function sendMessage(){
   if(!socket || !socket.connected) return;
+  closeMentionAutocomplete();
   const input = $('messageInput');
   const text = input.value.trim();
 
@@ -2031,6 +2055,7 @@ async function renderMembers(){
     title.textContent = 'Conversation';
     holder.appendChild(title);
     [username, activeDMUser].forEach(user => holder.appendChild(memberRow({ username:user, displayName:displayNameFor(user), role:'member' })));
+    currentMembersList = [username, activeDMUser].map(u => ({ username:u, displayName:displayNameFor(u) }));
     return;
   }
 
@@ -2046,6 +2071,7 @@ async function renderMembers(){
       const online = members.filter(m => onlineUserList.includes(m.username));
       const offline = members.filter(m => !onlineUserList.includes(m.username));
       paintMemberGroups(holder, online, offline, group.owner);
+      currentMembersList = members.map(m => ({ username:m.username, displayName:displayNameFor(m.username) }));
     }catch(e){}
     return;
   }
@@ -2063,6 +2089,7 @@ async function renderMembers(){
     const online = members.filter(m => onlineUserList.includes(m.username));
     const offline = members.filter(m => !onlineUserList.includes(m.username));
     paintMemberGroups(holder, online, offline, server.owner);
+    currentMembersList = members.map(m => ({ username:m.username, displayName:displayNameFor(m.username) }));
   }catch(e){}
 }
 
@@ -2405,6 +2432,23 @@ function modalMessage(text, isError){
 async function openSettings(){
   const avatarUrl = avatarUrlFor(username);
 
+  // The "on" flag is stored in localStorage, but the real switch is the
+  // browser's own Notification permission - if that got revoked (denied
+  // in browser settings, site data cleared, etc.) after the flag was set,
+  // notifications would silently stop firing while the toggle still shows
+  // as checked. Catch that here so the toggle always reflects reality.
+  if(desktopNotificationsEnabled && (typeof Notification === 'undefined' || Notification.permission !== 'granted')){
+    desktopNotificationsEnabled = false;
+    try{ localStorage.setItem('desktopNotifications', '0'); }catch(e){}
+  }
+  if(pushNotificationsEnabled){
+    try{
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = reg && await reg.pushManager.getSubscription();
+      if(!sub){ pushNotificationsEnabled = false; localStorage.setItem('pushNotifications', '0'); }
+    }catch(e){ pushNotificationsEnabled = false; try{ localStorage.setItem('pushNotifications', '0'); }catch(e2){} }
+  }
+
   // If a server-wide or the site-wide censor is already on, personal
   // choice doesn't matter - messages show censored either way - so the
   // toggle is shown forced-on and disabled rather than letting someone
@@ -2462,6 +2506,13 @@ async function openSettings(){
         'Notify me on this device about new messages</label>' +
         '<div class="modalNote">Only while a tab here is open somewhere (even minimized or in another tab) but not the one you\'re looking at - this can\'t reach you once the browser is fully closed. Notifications always clearly say which channel or DM they\'re from.</div>' +
       '</div>' +
+      '<div class="settingsRow">' +
+        '<label class="formLabel">Push notifications</label>' +
+        '<label style="display:flex;align-items:center;gap:8px;font-weight:normal">' +
+        '<input type="checkbox" id="pushToggle" style="width:auto"' + (pushNotificationsEnabled ? ' checked' : '') + '> ' +
+        'Notify me even when the browser is fully closed</label>' +
+        '<div class="modalNote">Sent for direct messages and for @mentions, delivered through your browser\'s push service. Same as above - always clearly labeled as coming from this chat, for this DM or channel, never anything else.</div>' +
+      '</div>' +
       '<div class="modalMsg" id="modalMsg"></div>' +
     '</div>' +
     '<div class="modalFoot"><button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" id="saveProfileBtn">Save Changes</button></div>'
@@ -2480,6 +2531,9 @@ async function openSettings(){
 
   const notifyToggle = $('notifyToggle');
   if(notifyToggle) notifyToggle.onchange = () => setDesktopNotifications(notifyToggle.checked, notifyToggle);
+
+  const pushToggle = $('pushToggle');
+  if(pushToggle) pushToggle.onchange = () => setPushNotifications(pushToggle.checked, pushToggle);
 }
 
 async function setDesktopNotifications(enabled, toggleEl){
@@ -2504,6 +2558,66 @@ async function setDesktopNotifications(enabled, toggleEl){
   desktopNotificationsEnabled = true;
   try{ localStorage.setItem('desktopNotifications', '1'); }catch(e){}
   toast('Desktop notifications turned on');
+}
+
+function urlBase64ToUint8Array(base64String){
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const output = new Uint8Array(rawData.length);
+  for(let i = 0; i < rawData.length; i++) output[i] = rawData.charCodeAt(i);
+  return output;
+}
+
+async function setPushNotifications(enabled, toggleEl){
+  if(!enabled){
+    try{
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = reg && await reg.pushManager.getSubscription();
+      if(sub){
+        await fetch('/push/unsubscribe', { method:'POST', headers:authHeaders(), body:JSON.stringify({ endpoint: sub.endpoint }) }).catch(()=>{});
+        await sub.unsubscribe();
+      }
+    }catch(e){}
+    pushNotificationsEnabled = false;
+    try{ localStorage.setItem('pushNotifications', '0'); }catch(e){}
+    toast('Push notifications turned off');
+    return;
+  }
+  if(!('serviceWorker' in navigator) || !('PushManager' in window) || typeof Notification === 'undefined'){
+    toast('Your browser does not support push notifications');
+    if(toggleEl) toggleEl.checked = false;
+    return;
+  }
+  try{
+    let permission = Notification.permission;
+    if(permission === 'default') permission = await Notification.requestPermission();
+    if(permission !== 'granted'){
+      toast('Notifications are blocked - allow them for this site in your browser settings');
+      if(toggleEl) toggleEl.checked = false;
+      return;
+    }
+    const keyRes = await fetch('/push/vapid-public-key', { headers: authHeaders() });
+    const keyData = await keyRes.json();
+    if(!keyRes.ok || !keyData.key) throw new Error('server has no push key yet');
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if(!sub){
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(keyData.key)
+      });
+    }
+    const response = await fetch('/push/subscribe', { method:'POST', headers:authHeaders(), body:JSON.stringify({ subscription: sub.toJSON() }) });
+    if(!response.ok) throw new Error('could not save subscription');
+    pushNotificationsEnabled = true;
+    try{ localStorage.setItem('pushNotifications', '1'); }catch(e){}
+    toast('Push notifications turned on');
+  }catch(err){
+    toast('Could not enable push notifications: ' + err.message);
+    if(toggleEl) toggleEl.checked = false;
+  }
 }
 
 async function setPersonalCensor(enabled){
@@ -2881,12 +2995,112 @@ function autoResize(){
   input.style.height = Math.min(input.scrollHeight, 220) + 'px';
 }
 
+/* ============================ @mention autocomplete ============================ */
+// currentMembersList is kept in sync by renderMembers() with whoever's
+// visible in the room/DM/group you're currently looking at.
+let currentMembersList = [];
+let mentionState = null; // { start, end } of the "@query" being typed, or null
+let mentionActiveIndex = 0;
+
+function mentionCandidates(query){
+  const q = query.toLowerCase();
+  return currentMembersList
+    .filter(m => m.username !== username)
+    .filter(m => m.username.toLowerCase().startsWith(q) || (m.displayName || '').toLowerCase().startsWith(q))
+    .slice(0, 8);
+}
+
+function updateMentionState(){
+  const el = $('messageInput');
+  const pos = el.selectionStart;
+  const uptoCursor = el.value.slice(0, pos);
+  const match = /(?:^|\s)@([a-zA-Z0-9_.-]{0,30})$/.exec(uptoCursor);
+  if(!match){ closeMentionAutocomplete(); return; }
+  const query = match[1];
+  const start = pos - query.length - 1;
+  const candidates = mentionCandidates(query);
+  if(!candidates.length){ closeMentionAutocomplete(); return; }
+  mentionState = { start, end: pos };
+  mentionActiveIndex = 0;
+  renderMentionAutocomplete(candidates);
+}
+
+function renderMentionAutocomplete(candidates){
+  const box = $('mentionAutocomplete');
+  box.innerHTML = '';
+  candidates.forEach((m, i) => {
+    const row = document.createElement('div');
+    row.className = 'mentionItem' + (i === mentionActiveIndex ? ' active' : '');
+    row.appendChild(createAvatar(m.username, 'sm'));
+    const name = document.createElement('span');
+    name.className = 'mentionName';
+    name.textContent = m.displayName || m.username;
+    row.appendChild(name);
+    if((m.displayName || m.username) !== m.username){
+      const uname = document.createElement('span');
+      uname.className = 'mentionUsername';
+      uname.textContent = '@' + m.username;
+      row.appendChild(uname);
+    }
+    row.onmousedown = e => { e.preventDefault(); selectMention(m.username); };
+    box.appendChild(row);
+  });
+  box._candidates = candidates;
+  box.hidden = false;
+}
+
+function closeMentionAutocomplete(){
+  mentionState = null;
+  mentionActiveIndex = 0;
+  const box = $('mentionAutocomplete');
+  box.hidden = true;
+  box.innerHTML = '';
+  box._candidates = [];
+}
+
+function moveMentionSelection(delta){
+  const box = $('mentionAutocomplete');
+  const candidates = box._candidates || [];
+  if(!candidates.length) return;
+  mentionActiveIndex = (mentionActiveIndex + delta + candidates.length) % candidates.length;
+  renderMentionAutocomplete(candidates);
+}
+
+function selectMention(uname){
+  if(!mentionState) return;
+  const el = $('messageInput');
+  const value = el.value;
+  const before = value.slice(0, mentionState.start);
+  const after = value.slice(mentionState.end);
+  const inserted = '@' + uname + ' ';
+  el.value = before + inserted + after;
+  const cursor = before.length + inserted.length;
+  closeMentionAutocomplete();
+  el.focus();
+  el.selectionStart = el.selectionEnd = cursor;
+  autoResize();
+}
+
 const input = $('messageInput');
-input.addEventListener('input', () => { autoResize(); sendTyping(); });
+input.addEventListener('input', () => { autoResize(); sendTyping(); updateMentionState(); });
 input.addEventListener('keydown', e => {
+  if(mentionState){
+    const box = $('mentionAutocomplete');
+    const candidates = box._candidates || [];
+    if(candidates.length && (e.key === 'Tab' || e.key === 'Enter')){
+      e.preventDefault();
+      selectMention(candidates[mentionActiveIndex].username);
+      return;
+    }
+    if(e.key === 'ArrowDown'){ e.preventDefault(); moveMentionSelection(1); return; }
+    if(e.key === 'ArrowUp'){ e.preventDefault(); moveMentionSelection(-1); return; }
+    if(e.key === 'Escape'){ e.preventDefault(); closeMentionAutocomplete(); return; }
+  }
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); }
   if(e.key === 'Escape'){ cancelReply(); }
 });
+input.addEventListener('click', () => updateMentionState());
+input.addEventListener('blur', () => setTimeout(closeMentionAutocomplete, 150));
 
 $('fileInput').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
 
