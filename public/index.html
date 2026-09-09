@@ -131,6 +131,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .channel{
   display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:4px;margin-bottom:2px;
   color:var(--text-muted);cursor:pointer;font-size:15px;font-weight:500;position:relative;
+  transition:background .12s ease,color .12s ease;
 }
 .channel:hover{background:var(--hover);color:var(--text);}
 .channel.active{background:var(--active);color:#fff;}
@@ -142,7 +143,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
   background:var(--red);color:#fff;font-size:12px;font-weight:700;min-width:16px;height:16px;
   border-radius:8px;display:none;align-items:center;justify-content:center;padding:0 5px;flex:0 0 auto;
 }
-.dmRow{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:4px;margin-bottom:2px;cursor:pointer;color:var(--text-muted);}
+.dmRow{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:4px;margin-bottom:2px;cursor:pointer;color:var(--text-muted);transition:background .12s ease,color .12s ease;}
 .dmRow:hover{background:var(--hover);color:var(--text);}
 .dmRow.active{background:var(--active);color:#fff;}
 .dmName{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;font-weight:500;}
@@ -183,12 +184,16 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .dayDivider .line{flex:1;height:1px;background:var(--divider);}
 .dayDivider span{font-size:12px;font-weight:600;color:var(--text-muted);}
 
-.message{display:flex;gap:16px;padding:2px 48px 2px 16px;position:relative;}
+.message{display:flex;gap:16px;padding:2px 48px 2px 16px;position:relative;transition:background .1s ease;}
 .message:hover{background:rgba(2,2,2,.06);}
 .message.grouped{margin-top:0;}
 .message.first{margin-top:17px;}
 .message.mentioned{background:rgba(250,168,26,.1);box-shadow:inset 2px 0 0 #faa81a;}
 .message.mentioned:hover{background:rgba(250,168,26,.16);}
+@keyframes messageIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:translateY(0);}}
+.message.messageEnter{animation:messageIn .18s ease-out;}
+.msgText{transition:color .25s ease;}
+.message.pending .msgText{color:var(--text-muted);}
 .msgGutter{width:40px;flex:0 0 40px;display:flex;justify-content:center;padding-top:2px;}
 .hoverTime{position:absolute;top:-6px;right:154px;font-size:11px;white-space:nowrap;color:var(--text-muted);opacity:0;line-height:1.2;}
 .message:hover .hoverTime{opacity:1;}
@@ -235,9 +240,11 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .msgActions button.danger:hover{color:var(--red);}
 
 .reactions{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}
+@keyframes reactionPop{from{transform:scale(.7);opacity:.4;}to{transform:scale(1);opacity:1;}}
 .reaction{
   display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);border:1px solid transparent;
   border-radius:8px;padding:2px 6px;font-size:14px;cursor:pointer;line-height:1.4;
+  transition:background .12s ease,border-color .12s ease;animation:reactionPop .15s ease;
 }
 .reaction:hover{border-color:#4e5058;}
 .reaction.mine{background:rgba(88,101,242,.16);border-color:var(--brand);}
@@ -280,7 +287,9 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
   position:absolute;left:16px;right:16px;bottom:100%;margin-bottom:8px;
   background:#111214;border-radius:8px;box-shadow:0 8px 16px rgba(0,0,0,.24);
   overflow:hidden;max-height:224px;overflow-y:auto;
+  opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease;
 }
+.mentionAutocomplete.show{opacity:1;pointer-events:auto;transform:translateY(0);}
 .mentionItem{display:flex;align-items:center;gap:10px;padding:6px 12px;cursor:pointer;font-size:14px;color:var(--text);}
 .mentionItem.active,.mentionItem:hover{background:var(--brand);}
 .mentionName{font-weight:600;}
@@ -336,7 +345,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 #members{width:240px;flex:0 0 240px;background:var(--members);overflow-y:auto;padding:16px 8px;}
 #members.hidden{display:none;}
 .memberGroupTitle{font-size:12px;font-weight:600;text-transform:uppercase;color:var(--text-muted);padding:16px 8px 4px 8px;}
-.memberRow{display:flex;align-items:center;gap:12px;padding:5px 8px;border-radius:4px;cursor:pointer;}
+.memberRow{display:flex;align-items:center;gap:12px;padding:5px 8px;border-radius:4px;cursor:pointer;transition:background .12s ease;}
 .memberRow:hover{background:var(--hover);}
 .memberRow.offline{opacity:.45;}
 .memberName{font-size:15px;font-weight:500;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
@@ -364,16 +373,23 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .avatarWrap.sm .presence{width:12px;height:12px;border-width:2.5px;}
 
 /* modals */
-#overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;z-index:100;padding:20px;}
-#overlay.open{display:flex;}
-.modal{width:460px;max-width:100%;max-height:88vh;overflow-y:auto;background:var(--modal);border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.45);}
+#overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;
+  opacity:0;pointer-events:none;transition:opacity .15s ease;
+}
+#overlay.open{opacity:1;pointer-events:auto;}
+.modal{
+  width:460px;max-width:100%;max-height:88vh;overflow-y:auto;background:var(--modal);border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.45);
+  transform:translateY(10px) scale(.98);transition:transform .18s ease;
+}
+#overlay.open .modal{transform:translateY(0) scale(1);}
 .modal.wide{width:660px;}
 .modalHead{padding:24px 24px 8px 24px;text-align:center;}
 .modalHead h2{color:var(--text-bright);font-size:24px;margin-bottom:8px;}
 .modalHead p{color:var(--text-muted);font-size:15px;line-height:1.4;}
 .modalBody{padding:8px 24px 24px 24px;}
 .modalFoot{padding:16px 24px;background:#2b2d31;display:flex;justify-content:flex-end;gap:8px;border-radius:0 0 8px 8px;align-items:center;}
-.btn{padding:10px 16px;font-size:14px;font-weight:500;border-radius:3px;background:var(--brand);color:#fff;}
+.btn{padding:10px 16px;font-size:14px;font-weight:500;border-radius:3px;background:var(--brand);color:#fff;transition:background .12s ease;}
 .btn:hover{background:var(--brand-hover);}
 .btn.ghost{background:transparent;color:var(--text);}
 .btn.ghost:hover{background:transparent;text-decoration:underline;}
@@ -414,8 +430,11 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
 .contextSep{height:1px;background:#2e2f34;margin:4px 0;}
 
 /* lightbox */
-#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;z-index:200;padding:40px 20px;}
-#lightbox.open{display:flex;}
+#lightbox{
+  position:fixed;inset:0;background:rgba(0,0,0,.9);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;z-index:200;padding:40px 20px;
+  opacity:0;pointer-events:none;transition:opacity .15s ease;
+}
+#lightbox.open{opacity:1;pointer-events:auto;}
 #lightbox img{max-width:100%;max-height:80vh;border-radius:6px;object-fit:contain;}
 #lightboxBar{display:flex;gap:16px;align-items:center;color:#dbdee1;font-size:14px;}
 #lightboxBar a{color:var(--link);text-decoration:none;}
@@ -516,7 +535,7 @@ input,textarea{font-family:inherit;border:none;outline:none;color:var(--text-bri
     <div id="messages"><div id="messagesInner"></div></div>
     <div id="typingIndicator"></div>
     <div id="composerArea">
-      <div id="mentionAutocomplete" class="mentionAutocomplete" hidden></div>
+      <div id="mentionAutocomplete" class="mentionAutocomplete"></div>
       <div id="composerBox">
         <div id="replyBar">
           <div>Replying to <b id="replyTarget"></b></div>
@@ -598,6 +617,14 @@ let pendingFiles = [];
 let replyTo = null;
 let lastItem = null;            // last rendered timeline entry (for grouping)
 let lastDayKey = '';
+
+// Optimistic sends: a message you send shows up immediately (greyed out)
+// instead of waiting for a round trip to the server, then turns full-color
+// once it's confirmed. tempId -> { room, realId } for anything still
+// in flight; realId gets filled in as soon as either the ack or the
+// server's own broadcast of that message tells us what it is.
+let pendingSendSeq = 0;
+const pendingSends = new Map();
 let editingId = null;
 let typingUsers = new Map();
 let typingTimer = null;
@@ -865,6 +892,10 @@ function cacheFromPayload(msg){
 
 function handleIncoming(msg, kind){
   cacheFromPayload(msg);
+  // This may be the server's own echo of something we already showed
+  // optimistically when we sent it - if so, just upgrade that element in
+  // place (grey -> full color) instead of appending a duplicate.
+  if(kind === 'message' && msg.user === username && confirmPendingSendData(msg)) return;
   maybeNotifyDesktop(msg, kind, '#' + roomLabel(msg.room) + ' - ' + displayNameFor(msg.user));
   if(msg.room === currentRoom){
     appendItem({ kind, data:msg });
@@ -875,6 +906,7 @@ function handleIncoming(msg, kind){
 
 function handleIncomingDM(msg, kind){
   cacheFromPayload(msg);
+  if(kind === 'message' && msg.user === username && confirmPendingSendData(msg)) return;
   const other = msg.user === username ? (msg.to || msg.dmTo) : msg.user;
   const room = msg.room || roomNameForDM(username, other);
   maybeNotifyDesktop(msg, kind, displayNameFor(msg.user) + ' (DM)');
@@ -1406,6 +1438,9 @@ function appendItem(item, bulk){
 
   const grouped = shouldGroup(item, lastItem);
   const el = buildMessageEl(item, grouped);
+  // A message that just arrived live (not part of a bulk history load)
+  // gets a brief fade-and-rise entrance instead of just popping into place.
+  if(!bulk) el.classList.add('messageEnter');
   // Always jump to the bottom for a message you just sent yourself, even
   // if you'd scrolled up to read older history - the same way sending a
   // message does in most chat apps, so you can see what you sent.
@@ -1417,6 +1452,7 @@ function appendItem(item, bulk){
   if(!bulk && item.kind === 'message' && socket && item.data.id){
     socket.emit('markRead', { room: currentRoom, lastMessageId: item.data.id });
   }
+  return el;
 }
 
 /* ============================ swear censor ============================ */
@@ -1505,7 +1541,7 @@ function censorRenderedElement(el, room){
 function buildMessageEl(item, grouped){
   const data = item.data;
   const wrap = document.createElement('div');
-  wrap.className = 'message' + (grouped ? ' grouped' : ' first');
+  wrap.className = 'message' + (grouped ? ' grouped' : ' first') + (data.pending ? ' pending' : '');
   if(item.kind === 'message') wrap.dataset.messageId = data.id;
   else wrap.dataset.fileId = data.id;
   if(data.user !== username && String(data.text || '').includes('@' + username)) wrap.classList.add('mentioned');
@@ -1612,6 +1648,7 @@ function buildActions(item){
   const bar = document.createElement('div');
   bar.className = 'msgActions';
   const data = item.data;
+  if(data.pending) return bar; // nothing to react to/edit/delete until the server confirms it
 
   if(item.kind === 'message'){
     const react = document.createElement('button');
@@ -1899,18 +1936,93 @@ async function sendMessage(){
 
   if(!text) return;
   const payload = { text, replyTo: replyTo ? replyTo.id : null };
+  const room = activeDMUser ? roomNameForDM(username, activeDMUser) : currentRoom;
+
+  // Show it right away, greyed out, instead of waiting for the round trip.
+  const tempId = 'pending:' + (++pendingSendSeq);
+  const pendingItem = {
+    kind: 'message',
+    data: {
+      id: tempId, room, user: username, displayName: displayNameFor(username),
+      avatarUrl: avatarUrlFor(username), text, to: activeDMUser || '', dmTo: activeDMUser || '',
+      isGroup: !!currentGroupRoom, replyTo: replyTo ? { id:replyTo.id, user:replyTo.user, displayName:replyTo.displayName, text:replyTo.text } : null,
+      editedAt: '', deleted:false, deletedBy:'', reactions: [], createdAt: new Date().toISOString(), pending: true
+    }
+  };
+  appendItem(pendingItem);
+  pendingSends.set(tempId, { room, realId: null });
+  // Self-heals if a confirmation is ever lost entirely (dropped ack, no
+  // broadcast) so a stale entry can't wrongly latch onto some unrelated
+  // later message in the same room.
+  setTimeout(() => pendingSends.delete(tempId), 15000);
+
   if(activeDMUser){
     payload.to = activeDMUser;
-    socket.emit('dmMessage', payload, handleAck);
+    socket.emit('dmMessage', payload, result => {
+      if(result && result.error){ showError(result.error); pendingSends.delete(tempId); return; }
+      if(result && result.id) confirmPendingSendId(tempId, result.id);
+    });
   }else{
     payload.room = currentRoom;
-    socket.emit('message', payload, handleAck);
+    socket.emit('message', payload, result => {
+      if(result && result.error){ showError(result.error); pendingSends.delete(tempId); return; }
+      if(result && result.id) confirmPendingSendId(tempId, result.id);
+    });
   }
   input.value = '';
   autoResize();
   input.focus();
   cancelReply();
   stopTyping();
+}
+
+// The ack (an id) usually arrives after the server's own broadcast of the
+// same message (since the broadcast is sent first, then the ack), but
+// network timing isn't guaranteed - so this only records the real id and
+// does the lightweight "no longer pending" swap. confirmPendingSendData()
+// (called from the message/dmMessage socket handlers below) does the full
+// swap-in once the authoritative message arrives, whichever order things
+// come in.
+function confirmPendingSendId(tempId, realId){
+  const entry = pendingSends.get(tempId);
+  if(!entry || entry.realId) return; // already fully resolved by the broadcast
+  entry.realId = realId;
+  const el = document.querySelector('.message[data-message-id="' + tempId + '"]');
+  if(el){ el.dataset.messageId = realId; el.classList.remove('pending'); }
+}
+
+// Finds the pending send a just-arrived message/dmMessage broadcast
+// corresponds to (matching by id if the ack already ran, otherwise the
+// oldest still-unconfirmed send in that room), and swaps the optimistic
+// element for the real thing in place - same DOM node, so the grey-to-
+// white color change transitions smoothly instead of just popping.
+function confirmPendingSendData(msg){
+  let foundTempId = null;
+  for(const [tempId, entry] of pendingSends){
+    if(entry.realId === msg.id){ foundTempId = tempId; break; }
+  }
+  if(!foundTempId){
+    for(const [tempId, entry] of pendingSends){
+      if(!entry.realId && entry.room === msg.room){ foundTempId = tempId; break; }
+    }
+  }
+  if(!foundTempId) return false;
+  const entry = pendingSends.get(foundTempId);
+  const el = document.querySelector('.message[data-message-id="' + (entry.realId || foundTempId) + '"]');
+  pendingSends.delete(foundTempId);
+  if(!el) return true;
+  el.dataset.messageId = msg.id;
+  el.classList.remove('pending');
+  const item = { kind:'message', data: msg };
+  const timeEl = el.querySelector('.hoverTime');
+  if(timeEl) timeEl.textContent = formatTime(msg.createdAt);
+  const stampEl = el.querySelector('.msgTime');
+  if(stampEl) stampEl.textContent = formatStamp(msg.createdAt);
+  const oldActions = el.querySelector('.msgActions');
+  if(oldActions) oldActions.replaceWith(buildActions(item));
+  const reactionsHolder = el.querySelector('.reactions');
+  if(reactionsHolder) paintReactions(reactionsHolder, msg);
+  return true;
 }
 
 function handleAck(result){ if(result && result.error) showError(result.error); }
@@ -2512,6 +2624,7 @@ async function openSettings(){
         '<input type="checkbox" id="pushToggle" style="width:auto"' + (pushNotificationsEnabled ? ' checked' : '') + '> ' +
         'Notify me even when the browser is fully closed</label>' +
         '<div class="modalNote">Sent for direct messages and for @mentions, delivered through your browser\'s push service. Same as above - always clearly labeled as coming from this chat, for this DM or channel, never anything else.</div>' +
+        (pushNotificationsEnabled ? '<button class="btn grey" id="pushTestBtn" style="margin-top:8px">Send test notification</button>' : '') +
       '</div>' +
       '<div class="modalMsg" id="modalMsg"></div>' +
     '</div>' +
@@ -2534,6 +2647,24 @@ async function openSettings(){
 
   const pushToggle = $('pushToggle');
   if(pushToggle) pushToggle.onchange = () => setPushNotifications(pushToggle.checked, pushToggle);
+
+  const pushTestBtn = $('pushTestBtn');
+  if(pushTestBtn) pushTestBtn.onclick = sendTestPush;
+}
+
+// Forces a real push straight to this account's own subscriptions so
+// someone can check push actually works without needing a second account
+// to DM/mention them - reports exactly what happened (sent vs failed)
+// instead of a single ambiguous "should have worked."
+async function sendTestPush(){
+  try{
+    const response = await fetch('/push/test', { method:'POST', headers:authHeaders() });
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.error || 'could not send test notification');
+    if(data.sent > 0) toast('Test notification sent - check for it now (even with this tab focused).');
+    else if(data.failed > 0) toast('Push delivery failed: ' + (data.details[0] && data.details[0].error || 'unknown error'));
+    else toast('No active push subscription found - try turning push off and on again.');
+  }catch(err){ toast('Could not send test notification: ' + err.message); }
 }
 
 async function setDesktopNotifications(enabled, toggleEl){
@@ -3046,15 +3177,14 @@ function renderMentionAutocomplete(candidates){
     box.appendChild(row);
   });
   box._candidates = candidates;
-  box.hidden = false;
+  box.classList.add('show');
 }
 
 function closeMentionAutocomplete(){
   mentionState = null;
   mentionActiveIndex = 0;
   const box = $('mentionAutocomplete');
-  box.hidden = true;
-  box.innerHTML = '';
+  box.classList.remove('show');
   box._candidates = [];
 }
 
