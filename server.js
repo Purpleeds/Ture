@@ -1124,15 +1124,32 @@ async function ensureVapidKeys() {
 // title/body are provided by the caller and are never disguised.
 async function sendPushToUser(username, payload) {
   if (onlineUsers.has(username)) return; // already reachable live, skip push
-  if (!vapidPublicKey) return;
+  await deliverPush(username, payload);
+}
+
+// Actually calls out to the browser push service for every subscription a
+// user has, regardless of whether they're currently connected here - the
+// online check in sendPushToUser() above is what normally gates that, kept
+// separate so /push/test can force a real send even while the tab that's
+// testing it is wide open. Returns one result per subscription so a caller
+// (the test endpoint) can show the person exactly what happened instead of
+// a single "sent" that hides delivery failures.
+async function deliverPush(username, payload) {
+  if (!vapidPublicKey) return { sent: 0, failed: 0, details: [{ error: 'server has no VAPID keys yet - restart the server' }] };
   const subs = await q(`SELECT * FROM push_subscriptions WHERE username = $1`, [username]);
-  if (!subs.length) return;
+  if (!subs.length) return { sent: 0, failed: 0, details: [] };
   const body = JSON.stringify(payload);
+  const details = [];
+  let sent = 0, failed = 0;
   for (const sub of subs) {
     const subscription = { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } };
     try {
       await webpush.sendNotification(subscription, body);
+      sent++;
+      details.push({ endpoint: sub.endpoint.slice(-24), ok: true });
     } catch (err) {
+      failed++;
+      details.push({ endpoint: sub.endpoint.slice(-24), ok: false, error: err.message, statusCode: err.statusCode });
       if (err.statusCode === 404 || err.statusCode === 410) {
         // Subscription is gone (browser data cleared, uninstalled, etc.) - clean it up.
         await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [sub.endpoint]);
@@ -1141,6 +1158,7 @@ async function sendPushToUser(username, payload) {
       }
     }
   }
+  return { sent, failed, details };
 }
 
 // Finds @mentions in message text and pushes to any mentioned user who is
@@ -1191,6 +1209,23 @@ app.post('/push/unsubscribe', requireAuth, route(async (req, res) => {
   if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
   await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND username = $2`, [endpoint, req.username]);
   res.json({ message: 'ok' });
+}));
+
+// Sends a real push straight to the requesting user's own subscriptions,
+// bypassing the "only if you're not currently connected" rule that
+// sendPushToUser normally applies - so someone can verify push actually
+// works for them without closing every tab and getting a friend to DM
+// them. Reports per-subscription success/failure so a silent failure
+// (blocked at the OS level, an expired subscription, etc.) is visible
+// instead of just "nothing happened."
+app.post('/push/test', requireAuth, route(async (req, res) => {
+  const result = await deliverPush(req.username, {
+    title: 'Test notification',
+    body: 'If you can see this, push notifications are working.',
+    tag: 'push-test',
+    url: '/'
+  });
+  res.json(result);
 }));
 
 // ---------------- SERVERS ----------------
